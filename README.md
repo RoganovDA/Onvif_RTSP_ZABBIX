@@ -58,14 +58,31 @@
 
 ```json
 {
-  "Manufacturer": "Hikvision",
-  "Model": "DS-2CD2142FWD",
-  "FirmwareVersion": "V5.5.0",
-  "TimeSyncOK": true,
-  "RTSPPort": 554,
-  "status": "ok",
-  "real_fps": 24.5,
-  "avg_brightness": 112.3
+    "Manufacturer": "ActiveCam",
+    "Model": "AC-D8111IR2",
+    "FirmwareVersion": "IPCAM_V2.46.170906",
+    "SerialNumber": "D8111IR2M07Z031870873",
+    "HardwareId": "600110002-BV-H1002",
+    "HwAddress": "f0:23:b9:45:33:69",
+    "Address": "10.0.6.101",
+    "DNSname": null,
+    "TimeSyncOK": true,
+    "TimeDifferenceSeconds": 0,
+    "NewUsersDetected": false,
+    "NewUsernames": [],
+    "BaselineCreated": false,
+    "UserCount": 1,
+    "RTSPPort": 101,
+    "RTSPPath": "/live/main",
+    "status": "ok",
+    "frames_read": 53,
+    "avg_frame_size_kb": 3600.0,
+    "width": 1280,
+    "height": 960,
+    "avg_brightness": 131.98,
+    "frame_change_level": 0.1,
+    "real_fps": 17.67,
+    "note": ""
 }
 ```
 
@@ -96,7 +113,7 @@
 |:--------|:---------|:---------------------|
 | `ALLOWED_TIME_DIFF_SECONDS` | Допустимое расхождение времени UTC, сек | `120` |
 | `PORTS_TO_CHECK` | Список портов для проверки ONVIF | `[80, 8000, 8080, 8899, 10554, 10080, 554, 37777, 5000, 443]` |
-| `PASSWORDS` | Список известных паролей для подбора | `["admin", "12345678", "Iwec83jd23"]` |
+| `PASSWORDS` | Список известных паролей для подбора | `["admin", "12345678", "PASS3"]` |
 
 ---
 
@@ -112,19 +129,6 @@
   - `zeep`
 - Установленный `ffmpeg` (для опции fallback-проверки RTSP через ffprobe)
 
-**Также обязательно используется:**
-- `sys`
-- `json`
-- `datetime`
-- `socket`
-- `os`
-- `subprocess`
-- `time`
-- `cv2`
-- `numpy`
-- `urllib.parse`
-- `onvif`
-- `zeep`
 
 ---
 
@@ -136,9 +140,8 @@ MIT License.
 
 ## Авторы
 
-- [Ваше Имя или Никнейм](https://github.com/yourusername)
+- [RoganovDA](https://github.com/RoganovDA)
 
 ---
 
-*(Рекомендуется также добавить примеры вывода работы скрипта и примеры конфигурации для Zabbix)*
 
