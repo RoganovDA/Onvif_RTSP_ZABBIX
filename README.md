@@ -114,7 +114,7 @@
 - Тип элемента данных: `External Check`
 - Ключ вызова:  
   ```bash
-  camera_audit.py["{HOST.IP}"]
+  camcheck.py["{HOST.IP}"]
   ```
 - Тип данных: **Текст**
 - Предобработка на элементе:
