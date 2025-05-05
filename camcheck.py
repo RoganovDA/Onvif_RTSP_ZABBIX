@@ -144,10 +144,9 @@ def suppress_stderr():
             os.dup2(saved_stderr_fd, stderr_fd)
             os.close(saved_stderr_fd)
 
-def check_rtsp_stream(url, timeout=5, duration=3.0):
+def check_rtsp_stream(url, timeout=5, duration=5.0):
     start_time = time.time()
-    with suppress_stderr():
-        cap = cv2.VideoCapture(url)
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     result = {
         "status": "error",
         "frames_read": 0,
@@ -170,7 +169,7 @@ def check_rtsp_stream(url, timeout=5, duration=3.0):
 
     while time.time() - start_time < duration:
         ret, frame = cap.read()
-        if not ret or frame is None:
+        if not ret or frame is None or frame.size == 0:
             continue
 
         frames += 1
@@ -205,7 +204,6 @@ def check_rtsp_stream(url, timeout=5, duration=3.0):
 
     return result
 
-
 def fallback_ffprobe(url, timeout=5):
     cmd = [
         "ffprobe", "-v", "error",
@@ -224,6 +222,110 @@ def fallback_ffprobe(url, timeout=5):
     except Exception:
         pass
     return False
+
+
+
+def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0, width=1280, height=960):
+    import subprocess
+    import numpy as np
+    import cv2
+    import time
+
+    result = {
+        "status": "error",
+        "frames_read": 0,
+        "avg_frame_size_kb": 0.0,
+        "width": None,
+        "height": None,
+        "avg_brightness": 0.0,
+        "frame_change_level": 0.0,
+        "real_fps": 0.0,
+        "note": "Failed to open stream"
+    }
+
+    start_time = time.time()
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    frames, sizes, brightness, change_levels = 0, [], [], []
+    prev_gray = None
+
+    while time.time() - start_time < duration:
+        ret, frame = cap.read()
+        if not ret or frame is None or frame.size == 0:
+            continue
+        frames += 1
+        sizes.append(frame.nbytes)
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        brightness.append(np.mean(gray))
+        if prev_gray is not None:
+            delta = np.mean(np.abs(gray.astype("int16") - prev_gray.astype("int16")))
+            change_levels.append(delta)
+        prev_gray = gray
+
+    cap.release()
+
+    if frames > 0:
+        result.update({
+            "status": "ok",
+            "frames_read": frames,
+            "avg_frame_size_kb": round(sum(sizes) / len(sizes) / 1024, 2),
+            "width": w,
+            "height": h,
+            "avg_brightness": round(np.mean(brightness), 2),
+            "frame_change_level": round(np.mean(change_levels), 2) if change_levels else 0.0,
+            "real_fps": round(frames / duration, 2),
+            "note": "Read via OpenCV"
+        })
+        return result
+
+    # Если не получили кадры — пробуем через ffmpeg
+    try:
+        cmd = [
+            "ffmpeg", "-rtsp_transport", "tcp", "-i", url,
+            "-loglevel", "quiet", "-an", "-c:v", "rawvideo",
+            "-pix_fmt", "bgr24", "-f", "rawvideo", "-"
+        ]
+        pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**8)
+
+        frames, sizes, brightness, change_levels = 0, [], [], []
+        prev_gray = None
+        start_time = time.time()
+
+        while time.time() - start_time < duration:
+            raw = pipe.stdout.read(width * height * 3)
+            if len(raw) != width * height * 3:
+                continue
+            frame = np.frombuffer(raw, np.uint8).reshape((height, width, 3))
+            frames += 1
+            sizes.append(frame.nbytes)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            brightness.append(np.mean(gray))
+            if prev_gray is not None:
+                delta = np.mean(np.abs(gray.astype("int16") - prev_gray.astype("int16")))
+                change_levels.append(delta)
+            prev_gray = gray
+
+        pipe.terminate()
+
+        if frames > 0:
+            result.update({
+                "status": "ok",
+                "frames_read": frames,
+                "avg_frame_size_kb": round(sum(sizes) / len(sizes) / 1024, 2),
+                "width": width,
+                "height": height,
+                "avg_brightness": round(np.mean(brightness), 2),
+                "frame_change_level": round(np.mean(change_levels), 2) if change_levels else 0.0,
+                "real_fps": round(frames / duration, 2),
+                "note": "Read via ffmpeg pipe"
+            })
+        else:
+            result["note"] = "Connected but no valid frames from ffmpeg"
+
+    except Exception as e:
+        result["note"] = f"ffmpeg error: {e}"
+
+    return result
 
 
 def main():
@@ -320,7 +422,7 @@ def main():
 
         if rtsp_port and rtsp_path:
             rtsp_url = f"rtsp://{username}:{password}@{address}:{rtsp_port}{rtsp_path}"
-            rtsp_info = check_rtsp_stream(rtsp_url)
+            rtsp_info = check_rtsp_stream_with_fallback(rtsp_url)
             if rtsp_info["status"] != "ok":
                 if fallback_ffprobe(rtsp_url):
                     rtsp_info["status"] = "ok"
