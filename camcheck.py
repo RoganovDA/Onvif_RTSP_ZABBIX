@@ -10,6 +10,8 @@ import subprocess
 import time
 import cv2
 import numpy as np
+import contextlib
+
 from urllib.parse import urlparse
 from onvif import ONVIFCamera
 from zeep.exceptions import Fault
@@ -129,9 +131,23 @@ def get_rtsp_info(camera):
         return None, None
 
 
+
+@contextlib.contextmanager
+def suppress_stderr():
+    with open(os.devnull, 'w') as devnull:
+        stderr_fd = sys.stderr.fileno()
+        saved_stderr_fd = os.dup(stderr_fd)
+        os.dup2(devnull.fileno(), stderr_fd)
+        try:
+            yield
+        finally:
+            os.dup2(saved_stderr_fd, stderr_fd)
+            os.close(saved_stderr_fd)
+
 def check_rtsp_stream(url, timeout=5, duration=3.0):
     start_time = time.time()
-    cap = cv2.VideoCapture(url)
+    with suppress_stderr():
+        cap = cv2.VideoCapture(url)
     result = {
         "status": "error",
         "frames_read": 0,
@@ -253,12 +269,22 @@ def main():
             output['HwAddress'] = getattr(info, 'HwAddress', None) if info else None
             output['Address'] = getattr(from_dhcp, 'Address', None) if from_dhcp else None
 
+        output['DNSname'] = None
+
         if ntp_info and not isinstance(ntp_info, dict):
-            ntp_manual = getattr(ntp_info, 'NTPManual', None)
-            if ntp_manual and isinstance(ntp_manual, list) and len(ntp_manual) > 0:
-                output['DNSname'] = getattr(ntp_manual[0], 'DNSname', None)
-            else:
-                output['DNSname'] = None
+                for key in ('NTPManual', 'NTPFromDHCP'):
+                    entries = getattr(ntp_info, key, [])
+                    if isinstance(entries, list):
+                        for entry in entries:
+                            for attr in ('DNSname', 'IPv4Address'):
+                                val = getattr(entry, attr, None)
+                                if val:
+                                    output['DNSname'] = val
+                                    break
+                            if output['DNSname']:
+                                break
+                    if output['DNSname']:
+                        break
 
         now_utc = datetime.datetime.utcnow()
         camera_utc = parse_datetime(datetime_info)
