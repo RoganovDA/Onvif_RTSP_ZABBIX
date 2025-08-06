@@ -59,7 +59,7 @@
 
 3. Поместить скрипт в директорию `externalscripts` Zabbix сервера:
     ```bash
-    wget https://raw.githubusercontent.com/RoganovDA/
+    wget https://github.com/RoganovDA/Onvif_RTSP_ZABBIX/archive/refs/heads/main.zip -O Onvif_RTSP_ZABBIX.zip && unzip Onvif_RTSP_ZABBIX.zip && cd Onvif_RTSP_ZABBIX-main
     cp camcheck.py /usr/lib/zabbix/externalscripts/
     chmod +x /usr/lib/zabbix/externalscripts/camcheck.py
     mkdir /usr/lib/zabbix/externalscripts/onvif_audit
