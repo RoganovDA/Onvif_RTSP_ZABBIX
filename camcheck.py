@@ -136,18 +136,22 @@ def find_working_credentials(ip, ports, username='admin'):
                 return port, password
             if status == "unauthorized":
                 remove_baseline(ip)
-                print(json.dumps({"error": f"Invalid password for {ip}"}))
-                sys.exit(1)
+                baseline = None
+                password = None
+                port = None
         if password:
             port = find_onvif_port(ip, ports, username=username, password=password)
             if port == "unauthorized":
                 remove_baseline(ip)
-                print(json.dumps({"error": f"Invalid password for {ip}"}))
-                sys.exit(1)
-            if port:
+                baseline = None
+                password = None
+            elif port:
                 return port, password
-        # Baseline credentials didn't work; remove stale baseline
+        # Baseline credentials didn't work; remove stale baseline and reset
         remove_baseline(ip)
+        baseline = None
+        password = None
+        port = None
 
     for password in PASSWORDS:
         port = find_onvif_port(ip, ports, username=username, password=password)
@@ -210,6 +214,19 @@ def check_rtsp_stream(url, timeout=5, duration=5.0):
 
     if not cap.isOpened():
         cap.release()
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-rtsp_transport", "tcp",
+            "-timeout", str(int(timeout * 1e6)),
+            "-i", url,
+        ]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+            err_out = (p.stderr or "") + (p.stdout or "")
+            if "401" in err_out or "Unauthorized" in err_out:
+                return {"status": "unauthorized"}
+        except Exception:
+            pass
         return result
 
     frames, sizes, brightness, change_levels = 0, [], [], []
@@ -264,13 +281,18 @@ def fallback_ffprobe(url, timeout=5):
         "-of", "json"
     ]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout+2)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+        err_out = (p.stderr or "") + (p.stdout or "")
+        if "401" in err_out or "Unauthorized" in err_out:
+            return "unauthorized"
         info = json.loads(p.stdout)
         if info.get("streams"):
             return True
     except Exception:
         pass
     return False
+
+
 
 
 
@@ -289,7 +311,7 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0, width=1280, he
         "avg_brightness": 0.0,
         "frame_change_level": 0.0,
         "real_fps": 0.0,
-        "note": "Failed to open stream"
+        "note": "Failed to open stream",
     }
 
     start_time = time.time()
@@ -323,18 +345,23 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0, width=1280, he
             "avg_brightness": round(np.mean(brightness), 2),
             "frame_change_level": round(np.mean(change_levels), 2) if change_levels else 0.0,
             "real_fps": round(frames / duration, 2),
-            "note": "Read via OpenCV"
+            "note": "Read via OpenCV",
         })
         return result
 
-    # Если не получили кадры — пробуем через ffmpeg
+    # Если не получили кадры — сначала проверяем через ffprobe
+    probe_status = fallback_ffprobe(url, timeout)
+    if probe_status == "unauthorized":
+        return {"status": "unauthorized"}
+
+    # Затем пробуем через ffmpeg
     try:
         cmd = [
             "ffmpeg", "-rtsp_transport", "tcp", "-i", url,
-            "-loglevel", "quiet", "-an", "-c:v", "rawvideo",
+            "-loglevel", "error", "-an", "-c:v", "rawvideo",
             "-pix_fmt", "bgr24", "-f", "rawvideo", "-"
         ]
-        pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**8)
+        pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
 
         frames, sizes, brightness, change_levels = 0, [], [], []
         prev_gray = None
@@ -355,6 +382,10 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0, width=1280, he
             prev_gray = gray
 
         pipe.terminate()
+        stderr_data = pipe.stderr.read().decode(errors="ignore") if pipe.stderr else ""
+        pipe.wait()
+        if "401" in stderr_data or "Unauthorized" in stderr_data:
+            return {"status": "unauthorized"}
 
         if frames > 0:
             result.update({
@@ -366,7 +397,7 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0, width=1280, he
                 "avg_brightness": round(np.mean(brightness), 2),
                 "frame_change_level": round(np.mean(change_levels), 2) if change_levels else 0.0,
                 "real_fps": round(frames / duration, 2),
-                "note": "Read via ffmpeg pipe"
+                "note": "Read via ffmpeg pipe",
             })
         else:
             result["note"] = "Connected but no valid frames from ffmpeg"
@@ -377,6 +408,9 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0, width=1280, he
     return result
 
 
+
+
+
 def main():
     if len(sys.argv) < 2:
         print(json.dumps({"error": "Usage: script.py <ADDRESS>"}))
@@ -385,44 +419,45 @@ def main():
     address = sys.argv[1]
     username = 'admin'
 
-    port, password = find_working_credentials(address, PORTS_TO_CHECK, username=username)
-    if port is None:
-        print(json.dumps({"error": f"Unable to find working credentials for {address}"}))
-        sys.exit(1)
+    while True:
+        port, password = find_working_credentials(address, PORTS_TO_CHECK, username=username)
+        if port is None:
+            print(json.dumps({"error": f"Unable to find working credentials for {address}"}))
+            sys.exit(1)
 
-    try:
-        camera = ONVIFCamera(address, port, username, password)
-        devicemgmt_service = camera.create_devicemgmt_service()
+        try:
+            camera = ONVIFCamera(address, port, username, password)
+            devicemgmt_service = camera.create_devicemgmt_service()
 
-        device_info = safe_call(devicemgmt_service, "GetDeviceInformation")
-        datetime_info = safe_call(devicemgmt_service, "GetSystemDateAndTime")
-        users = safe_call(devicemgmt_service, "GetUsers")
-        interfaces = safe_call(devicemgmt_service, "GetNetworkInterfaces")
-        ntp_info = safe_call(devicemgmt_service, "GetNTP")
-        dns_info = safe_call(devicemgmt_service, "GetDNS")
-        scopes = safe_call(devicemgmt_service, "GetScopes")
+            device_info = safe_call(devicemgmt_service, "GetDeviceInformation")
+            datetime_info = safe_call(devicemgmt_service, "GetSystemDateAndTime")
+            users = safe_call(devicemgmt_service, "GetUsers")
+            interfaces = safe_call(devicemgmt_service, "GetNetworkInterfaces")
+            ntp_info = safe_call(devicemgmt_service, "GetNTP")
+            dns_info = safe_call(devicemgmt_service, "GetDNS")
+            scopes = safe_call(devicemgmt_service, "GetScopes")
 
-        output = {}
+            output = {}
 
-        if device_info and not isinstance(device_info, dict):
-            output['Manufacturer'] = getattr(device_info, 'Manufacturer', None)
-            output['Model'] = getattr(device_info, 'Model', None)
-            output['FirmwareVersion'] = getattr(device_info, 'FirmwareVersion', None)
-            output['SerialNumber'] = getattr(device_info, 'SerialNumber', None)
-            output['HardwareId'] = getattr(device_info, 'HardwareId', None)
+            if device_info and not isinstance(device_info, dict):
+                output['Manufacturer'] = getattr(device_info, 'Manufacturer', None)
+                output['Model'] = getattr(device_info, 'Model', None)
+                output['FirmwareVersion'] = getattr(device_info, 'FirmwareVersion', None)
+                output['SerialNumber'] = getattr(device_info, 'SerialNumber', None)
+                output['HardwareId'] = getattr(device_info, 'HardwareId', None)
 
-        if isinstance(interfaces, list) and interfaces:
-            interface = interfaces[0]
-            info = getattr(interface, 'Info', None)
-            ipv4 = getattr(interface, 'IPv4', None)
-            config = getattr(ipv4, 'Config', None) if ipv4 else None
-            from_dhcp = getattr(config, 'FromDHCP', None) if config else None
-            output['HwAddress'] = getattr(info, 'HwAddress', None) if info else None
-            output['Address'] = getattr(from_dhcp, 'Address', None) if from_dhcp else None
+            if isinstance(interfaces, list) and interfaces:
+                interface = interfaces[0]
+                info = getattr(interface, 'Info', None)
+                ipv4 = getattr(interface, 'IPv4', None)
+                config = getattr(ipv4, 'Config', None) if ipv4 else None
+                from_dhcp = getattr(config, 'FromDHCP', None) if config else None
+                output['HwAddress'] = getattr(info, 'HwAddress', None) if info else None
+                output['Address'] = getattr(from_dhcp, 'Address', None) if from_dhcp else None
 
-        output['DNSname'] = None
+            output['DNSname'] = None
 
-        if ntp_info and not isinstance(ntp_info, dict):
+            if ntp_info and not isinstance(ntp_info, dict):
                 for key in ('NTPManual', 'NTPFromDHCP'):
                     entries = getattr(ntp_info, key, [])
                     if isinstance(entries, list):
@@ -437,95 +472,102 @@ def main():
                     if output['DNSname']:
                         break
 
-        now_utc = datetime.datetime.utcnow()
-        camera_utc = parse_datetime(datetime_info)
-        if camera_utc:
-            delta = abs((now_utc - camera_utc).total_seconds())
-            output['TimeSyncOK'] = delta <= ALLOWED_TIME_DIFF_SECONDS
-            output['TimeDifferenceSeconds'] = int(delta)
-        else:
-            output['TimeSyncOK'] = False
-            output['TimeDifferenceSeconds'] = None
+            now_utc = datetime.datetime.utcnow()
+            camera_utc = parse_datetime(datetime_info)
+            if camera_utc:
+                delta = abs((now_utc - camera_utc).total_seconds())
+                output['TimeSyncOK'] = delta <= ALLOWED_TIME_DIFF_SECONDS
+                output['TimeDifferenceSeconds'] = int(delta)
+            else:
+                output['TimeSyncOK'] = False
+                output['TimeDifferenceSeconds'] = None
 
-        usernames = [user.Username for user in users] if isinstance(users, list) else []
+            usernames = [user.Username for user in users] if isinstance(users, list) else []
 
-        baseline = load_baseline(address)
+            baseline = load_baseline(address)
 
-        rtsp_port = baseline.get("rtsp_port") if baseline else None
-        rtsp_path = baseline.get("rtsp_path") if baseline else None
-        if not (rtsp_port and rtsp_path):
-            rtsp_port, rtsp_path = get_rtsp_info(camera)
+            rtsp_port = baseline.get("rtsp_port") if baseline else None
+            rtsp_path = baseline.get("rtsp_path") if baseline else None
+            if not (rtsp_port and rtsp_path):
+                rtsp_port, rtsp_path = get_rtsp_info(camera)
 
-        if baseline is None:
-            save_baseline(address, {
-                "users": usernames,
-                "password": password,
-                "port": port,
-                "rtsp_port": rtsp_port,
-                "rtsp_path": rtsp_path,
-            })
-            output['NewUsersDetected'] = False
-            output['BaselineCreated'] = True
-        else:
-            new_users = list(set(usernames) - set(baseline.get("users", [])))
-            output['NewUsersDetected'] = len(new_users) > 0
-            output['NewUsernames'] = new_users
-            output['BaselineCreated'] = False
-            updated = False
-            if (
-                baseline.get("password") != password
-                or baseline.get("port") != port
-                or baseline.get("rtsp_port") != rtsp_port
-                or baseline.get("rtsp_path") != rtsp_path
-            ):
-                baseline.update({
+            if baseline is None:
+                save_baseline(address, {
+                    "users": usernames,
                     "password": password,
                     "port": port,
                     "rtsp_port": rtsp_port,
                     "rtsp_path": rtsp_path,
                 })
-                updated = True
-            if baseline.get("users") != usernames:
-                baseline["users"] = usernames
-                updated = True
-            if updated:
-                save_baseline(address, baseline)
+                output['NewUsersDetected'] = False
+                output['BaselineCreated'] = True
+            else:
+                new_users = list(set(usernames) - set(baseline.get("users", [])))
+                output['NewUsersDetected'] = len(new_users) > 0
+                output['NewUsernames'] = new_users
+                output['BaselineCreated'] = False
+                updated = False
+                if (
+                    baseline.get("password") != password
+                    or baseline.get("port") != port
+                    or baseline.get("rtsp_port") != rtsp_port
+                    or baseline.get("rtsp_path") != rtsp_path
+                ):
+                    baseline.update({
+                        "password": password,
+                        "port": port,
+                        "rtsp_port": rtsp_port,
+                        "rtsp_path": rtsp_path,
+                    })
+                    updated = True
+                if baseline.get("users") != usernames:
+                    baseline["users"] = usernames
+                    updated = True
+                if updated:
+                    save_baseline(address, baseline)
 
-        output['UserCount'] = len(usernames)
+            output['UserCount'] = len(usernames)
 
-        output['RTSPPort'] = rtsp_port
-        output['RTSPPath'] = rtsp_path
+            output['RTSPPort'] = rtsp_port
+            output['RTSPPath'] = rtsp_path
 
+            if rtsp_port and rtsp_path:
+                rtsp_url = f"rtsp://{username}:{password}@{address}:{rtsp_port}{rtsp_path}"
+                rtsp_info = check_rtsp_stream_with_fallback(rtsp_url)
+                if rtsp_info["status"] == "unauthorized":
+                    remove_baseline(address)
+                    continue
+                if rtsp_info["status"] != "ok":
+                    probe_status = fallback_ffprobe(rtsp_url)
+                    if probe_status == "unauthorized":
+                        remove_baseline(address)
+                        continue
+                    if probe_status:
+                        rtsp_info["status"] = "ok"
+                        rtsp_info["note"] += " | Metadata via ffprobe"
+                output.update(rtsp_info)
+            else:
+                output.update({
+                    "status": "no_rtsp",
+                    "frames_read": 0,
+                    "avg_frame_size_kb": 0,
+                    "width": None,
+                    "height": None,
+                    "avg_brightness": 0,
+                    "frame_change_level": 0,
+                    "real_fps": 0,
+                    "note": "No RTSP URI found",
+                })
 
-        if rtsp_port and rtsp_path:
-            rtsp_url = f"rtsp://{username}:{password}@{address}:{rtsp_port}{rtsp_path}"
-            rtsp_info = check_rtsp_stream_with_fallback(rtsp_url)
-            if rtsp_info["status"] != "ok":
-                if fallback_ffprobe(rtsp_url):
-                    rtsp_info["status"] = "ok"
-                    rtsp_info["note"] += " | Metadata via ffprobe"
-            output.update(rtsp_info)
-        else:
-            output.update({
-                "status": "no_rtsp",
-                "frames_read": 0,
-                "avg_frame_size_kb": 0,
-                "width": None,
-                "height": None,
-                "avg_brightness": 0,
-                "frame_change_level": 0,
-                "real_fps": 0,
-                "note": "No RTSP URI found"
-            })
+            print(json.dumps(output, indent=4, ensure_ascii=False, default=str))
+            break
 
-        print(json.dumps(output, indent=4, ensure_ascii=False, default=str))
-
-    except Fault as fault:
-        print(json.dumps({"error": f"ONVIF Fault: {fault}"}))
-        sys.exit(1)
-    except Exception as e:
-        print(json.dumps({"error": f"General Error: {e}"}))
-        sys.exit(1)
+        except Fault as fault:
+            print(json.dumps({"error": f"ONVIF Fault: {fault}"}))
+            sys.exit(1)
+        except Exception as e:
+            print(json.dumps({"error": f"General Error: {e}"}))
+            sys.exit(1)
 
 
 if __name__ == "__main__":
