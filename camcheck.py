@@ -13,7 +13,6 @@ import argparse
 import logging
 import shutil
 
-# предварительный парсинг для указания файла логов
 pre_parser = argparse.ArgumentParser(add_help=False)
 pre_parser.add_argument("--logfile")
 pre_args, _ = pre_parser.parse_known_args()
@@ -86,8 +85,8 @@ def try_onvif_connection(ip, port, username='admin', password='000000'):
     try:
         camera = ONVIFCamera(ip, port, username, password)
         devicemgmt_service = camera.create_devicemgmt_service()
-        device_info = devicemgmt_service.GetDeviceInformation()
-        if device_info:
+        users = devicemgmt_service.GetUsers()
+        if users:
             return True
     except (Fault, ONVIFError) as err:
         msg = str(err)
@@ -125,7 +124,6 @@ def load_baseline(ip):
         remove_baseline(ip)
         return None
     if isinstance(data, list):
-        # Auto-upgrade very old format (list of usernames) to new format
         upgraded = {
             "users": data,
             "password": "",
@@ -179,7 +177,6 @@ def find_working_credentials(ip, ports, username='admin'):
                 password = None
             elif port:
                 return port, password
-        # Baseline credentials didn't work; remove stale baseline and reset
         remove_baseline(ip)
         baseline = None
         password = None
@@ -191,7 +188,6 @@ def find_working_credentials(ip, ports, username='admin'):
             continue
         if port:
             return port, password
-    # Nothing worked, ensure baseline is removed
     remove_baseline(ip)
     return None, None
 
@@ -631,3 +627,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
