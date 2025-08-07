@@ -8,18 +8,40 @@ import socket
 import os
 import subprocess
 import time
-import cv2
-import numpy as np
 import contextlib
+import argparse
+import logging
+import shutil
+
+# предварительный парсинг для указания файла логов
+pre_parser = argparse.ArgumentParser(add_help=False)
+pre_parser.add_argument("--logfile")
+pre_args, _ = pre_parser.parse_known_args()
+
+logging.basicConfig(
+    level=logging.INFO,
+    filename=pre_args.logfile,
+    filemode="a" if pre_args.logfile else None,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+try:
+    import cv2
+except Exception as e:
+    logging.error("Failed to import cv2: %s", e)
+    print(json.dumps({"error": "OpenCV (cv2) library not installed"}))
+    sys.exit(2)
+
+try:
+    import numpy as np
+except Exception as e:
+    logging.error("Failed to import numpy: %s", e)
+    print(json.dumps({"error": "NumPy library not installed"}))
+    sys.exit(3)
 
 from urllib.parse import urlparse
 from onvif import ONVIFCamera
 from zeep.exceptions import Fault
-
-# === Новый фикс ===
-os.environ["HOME"] = "/tmp"
-os.environ["TMPDIR"] = "/tmp"
-# ==================
 
 ALLOWED_TIME_DIFF_SECONDS = 120
 PORTS_TO_CHECK = [80, 8000, 8080, 8899, 10554, 10080, 554, 37777, 5000, 443]
@@ -63,8 +85,9 @@ def try_onvif_connection(ip, port, username='admin', password='000000'):
         msg = str(fault)
         if '401' in msg or 'Unauthorized' in msg:
             return "unauthorized"
-    except Exception:
-        pass
+        logging.error("ONVIF Fault on %s:%s - %s", ip, port, msg)
+    except Exception as e:
+        logging.error("ONVIF connection error on %s:%s - %s", ip, port, e, exc_info=True)
     return False
 
 
@@ -199,7 +222,8 @@ def suppress_stderr():
 
 def check_rtsp_stream(url, timeout=5, duration=5.0):
     start_time = time.time()
-    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    with suppress_stderr():
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     result = {
         "status": "error",
         "frames_read": 0,
@@ -221,7 +245,8 @@ def check_rtsp_stream(url, timeout=5, duration=5.0):
             "-i", url,
         ]
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+            with suppress_stderr():
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
             err_out = (p.stderr or "") + (p.stdout or "")
             if "401" in err_out or "Unauthorized" in err_out:
                 return {"status": "unauthorized"}
@@ -278,30 +303,31 @@ def fallback_ffprobe(url, timeout=5):
         "-i", url,
         "-select_streams", "v:0",
         "-show_entries", "stream=width,height,codec_name",
-        "-of", "json"
+        "-of", "json",
     ]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+        with suppress_stderr():
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
         err_out = (p.stderr or "") + (p.stdout or "")
         if "401" in err_out or "Unauthorized" in err_out:
-            return "unauthorized"
-        info = json.loads(p.stdout)
+            return {"status": "unauthorized"}
+        info = json.loads(p.stdout or "{}")
         if info.get("streams"):
-            return True
-    except Exception:
-        pass
-    return False
+            stream = info["streams"][0]
+            return {
+                "status": "ok",
+                "width": stream.get("width"),
+                "height": stream.get("height"),
+            }
+    except Exception as e:
+        logging.error("ffprobe error: %s", e, exc_info=True)
+    return {"status": "error"}
 
 
 
 
 
-def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0, width=1280, height=960):
-    import subprocess
-    import numpy as np
-    import cv2
-    import time
-
+def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
     result = {
         "status": "error",
         "frames_read": 0,
@@ -315,7 +341,8 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0, width=1280, he
     }
 
     start_time = time.time()
-    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    with suppress_stderr():
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     frames, sizes, brightness, change_levels = 0, [], [], []
     prev_gray = None
 
@@ -349,19 +376,21 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0, width=1280, he
         })
         return result
 
-    # Если не получили кадры — сначала проверяем через ffprobe
-    probe_status = fallback_ffprobe(url, timeout)
-    if probe_status == "unauthorized":
+    probe = fallback_ffprobe(url, timeout)
+    if probe.get("status") == "unauthorized":
         return {"status": "unauthorized"}
 
-    # Затем пробуем через ffmpeg
+    width = probe.get("width") or 1280
+    height = probe.get("height") or 720
+
     try:
         cmd = [
             "ffmpeg", "-rtsp_transport", "tcp", "-i", url,
             "-loglevel", "error", "-an", "-c:v", "rawvideo",
-            "-pix_fmt", "bgr24", "-f", "rawvideo", "-"
+            "-pix_fmt", "bgr24", "-f", "rawvideo", "-",
         ]
-        pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
+        with suppress_stderr():
+            pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
 
         frames, sizes, brightness, change_levels = 0, [], [], []
         prev_gray = None
@@ -403,6 +432,7 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0, width=1280, he
             result["note"] = "Connected but no valid frames from ffmpeg"
 
     except Exception as e:
+        logging.error("ffmpeg fallback error: %s", e, exc_info=True)
         result["note"] = f"ffmpeg error: {e}"
 
     return result
@@ -412,12 +442,24 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0, width=1280, he
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(json.dumps({"error": "Usage: script.py <ADDRESS>"}))
+    parser = argparse.ArgumentParser(description="ONVIF/RTSP Camera Audit Script")
+    parser.add_argument("address", nargs="?", help="Camera IP address")
+    parser.add_argument("--logfile", help="Path to log file")
+    args = parser.parse_args()
+
+    if not args.address:
+        print(json.dumps({"error": "Usage: camcheck.py <ADDRESS>"}))
         sys.exit(1)
 
-    address = sys.argv[1]
+    address = args.address
     username = 'admin'
+
+    missing_bins = [b for b in ("ffprobe", "ffmpeg") if shutil.which(b) is None]
+    if missing_bins:
+        msg = f"Missing executables: {', '.join(missing_bins)}"
+        logging.error(msg)
+        print(json.dumps({"error": msg}))
+        sys.exit(4)
 
     while True:
         port, password = find_working_credentials(address, PORTS_TO_CHECK, username=username)
@@ -539,12 +581,15 @@ def main():
                     continue
                 if rtsp_info["status"] != "ok":
                     probe_status = fallback_ffprobe(rtsp_url)
-                    if probe_status == "unauthorized":
+                    if probe_status.get("status") == "unauthorized":
                         remove_baseline(address)
                         continue
-                    if probe_status:
+                    if probe_status.get("status") == "ok":
                         rtsp_info["status"] = "ok"
                         rtsp_info["note"] += " | Metadata via ffprobe"
+                        if not rtsp_info.get("width") and probe_status.get("width"):
+                            rtsp_info["width"] = probe_status.get("width")
+                            rtsp_info["height"] = probe_status.get("height")
                 output.update(rtsp_info)
             else:
                 output.update({
@@ -563,12 +608,15 @@ def main():
             break
 
         except Fault as fault:
+            logging.error("ONVIF Fault: %s", fault, exc_info=True)
             print(json.dumps({"error": f"ONVIF Fault: {fault}"}))
             sys.exit(1)
         except Exception as e:
+            logging.error("General Error: %s", e, exc_info=True)
             print(json.dumps({"error": f"General Error: {e}"}))
             sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+
