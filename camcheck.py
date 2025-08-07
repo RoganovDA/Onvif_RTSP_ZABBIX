@@ -27,6 +27,8 @@ logging.basicConfig(
 
 try:
     import cv2
+    if hasattr(cv2, "utils") and hasattr(cv2.utils, "logging"):
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
 except Exception as e:
     logging.error("Failed to import cv2: %s", e)
     print(json.dumps({"error": "OpenCV (cv2) library not installed"}))
@@ -132,7 +134,7 @@ def load_baseline(ip):
             "rtsp_path": None,
         }
         save_baseline(ip, upgraded)
-        print(f"[INFO] Upgraded old baseline format for {ip}")
+        logging.info("Upgraded old baseline format for %s", ip)
         return upgraded
 
     required_keys = {"users", "password", "port", "rtsp_port", "rtsp_path"}
@@ -229,8 +231,6 @@ def suppress_stderr():
 
 def check_rtsp_stream(url, timeout=5, duration=5.0):
     start_time = time.time()
-    with suppress_stderr():
-        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     result = {
         "status": "error",
         "frames_read": 0,
@@ -240,51 +240,53 @@ def check_rtsp_stream(url, timeout=5, duration=5.0):
         "avg_brightness": 0.0,
         "frame_change_level": 0.0,
         "real_fps": 0.0,
-        "note": "Failed to open stream"
+        "note": "Failed to open stream",
     }
 
-    if not cap.isOpened():
-        cap.release()
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-rtsp_transport", "tcp",
-            "-timeout", str(int(timeout * 1e6)),
-            "-i", url,
-        ]
-        try:
-            with suppress_stderr():
+    with suppress_stderr():
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+
+        if not cap.isOpened():
+            cap.release()
+            cmd = [
+                "ffprobe", "-v", "error",
+                "-rtsp_transport", "tcp",
+                "-timeout", str(int(timeout * 1e6)),
+                "-i", url,
+            ]
+            try:
                 p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
-            err_out = (p.stderr or "") + (p.stdout or "")
-            err_lower = err_out.lower()
-            if "401" in err_lower or "unauthorized" in err_lower or "not authorized" in err_lower:
-                return {"status": "unauthorized"}
-        except Exception:
-            pass
-        return result
+                err_out = (p.stderr or "") + (p.stdout or "")
+                err_lower = err_out.lower()
+                if "401" in err_lower or "unauthorized" in err_lower or "not authorized" in err_lower:
+                    return {"status": "unauthorized"}
+            except Exception:
+                pass
+            return result
 
-    frames, sizes, brightness, change_levels = 0, [], [], []
-    prev_gray = None
-    width = height = None
+        frames, sizes, brightness, change_levels = 0, [], [], []
+        prev_gray = None
+        width = height = None
 
-    while time.time() - start_time < duration:
-        ret, frame = cap.read()
-        if not ret or frame is None or frame.size == 0:
-            continue
+        while time.time() - start_time < duration:
+            ret, frame = cap.read()
+            if not ret or frame is None or frame.size == 0:
+                continue
 
-        frames += 1
-        sizes.append(frame.nbytes)
-        height, width = frame.shape[:2]
+            frames += 1
+            sizes.append(frame.nbytes)
+            height, width = frame.shape[:2]
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        brightness.append(np.mean(gray))
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            brightness.append(np.mean(gray))
 
-        if prev_gray is not None:
-            delta = np.mean(np.abs(gray.astype("int16") - prev_gray.astype("int16")))
-            change_levels.append(delta)
+            if prev_gray is not None:
+                delta = np.mean(np.abs(gray.astype("int16") - prev_gray.astype("int16")))
+                change_levels.append(delta)
 
-        prev_gray = gray
+            prev_gray = gray
 
-    cap.release()
+        cap.release()
 
     if frames > 0:
         result.update({
@@ -296,12 +298,13 @@ def check_rtsp_stream(url, timeout=5, duration=5.0):
             "avg_brightness": round(np.mean(brightness), 2),
             "frame_change_level": round(np.mean(change_levels), 2) if change_levels else 0.0,
             "real_fps": round(frames / duration, 2),
-            "note": ""
+            "note": "",
         })
     else:
         result["note"] = "Connected but no valid frames"
 
     return result
+
 
 def fallback_ffprobe(url, timeout=5):
     cmd = [
@@ -350,26 +353,26 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
     }
 
     start_time = time.time()
-    with suppress_stderr():
-        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     frames, sizes, brightness, change_levels = 0, [], [], []
     prev_gray = None
+    with suppress_stderr():
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
 
-    while time.time() - start_time < duration:
-        ret, frame = cap.read()
-        if not ret or frame is None or frame.size == 0:
-            continue
-        frames += 1
-        sizes.append(frame.nbytes)
-        h, w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        brightness.append(np.mean(gray))
-        if prev_gray is not None:
-            delta = np.mean(np.abs(gray.astype("int16") - prev_gray.astype("int16")))
-            change_levels.append(delta)
-        prev_gray = gray
+        while time.time() - start_time < duration:
+            ret, frame = cap.read()
+            if not ret or frame is None or frame.size == 0:
+                continue
+            frames += 1
+            sizes.append(frame.nbytes)
+            h, w = frame.shape[:2]
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            brightness.append(np.mean(gray))
+            if prev_gray is not None:
+                delta = np.mean(np.abs(gray.astype("int16") - prev_gray.astype("int16")))
+                change_levels.append(delta)
+            prev_gray = gray
 
-    cap.release()
+        cap.release()
 
     if frames > 0:
         result.update({
@@ -628,4 +631,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
