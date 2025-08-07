@@ -59,6 +59,10 @@ def try_onvif_connection(ip, port, username='admin', password='000000'):
         device_info = devicemgmt_service.GetDeviceInformation()
         if device_info:
             return True
+    except Fault as fault:
+        msg = str(fault)
+        if '401' in msg or 'Unauthorized' in msg:
+            return "unauthorized"
     except Exception:
         pass
     return False
@@ -68,8 +72,11 @@ def find_onvif_port(ip, ports, username='admin', password='000000', timeout=2):
     for port in ports:
         try:
             with socket.create_connection((ip, port), timeout=timeout):
-                if try_onvif_connection(ip, port, username, password):
+                status = try_onvif_connection(ip, port, username, password)
+                if status is True:
                     return port
+                if status == "unauthorized":
+                    return "unauthorized"
         except Exception:
             continue
     return None
@@ -79,28 +86,30 @@ def load_baseline(ip):
     path = os.path.join(AUDIT_DIR, f"{ip}_users.json")
     if not os.path.exists(path):
         return None
-    with open(path, "r") as f:
-        data = json.load(f)
-        if isinstance(data, list):
-            # Auto-upgrade very old format (list of usernames) to new format
-            upgraded = {
-                "users": data,
-                "password": "",
-                "port": None,
-                "rtsp_port": None,
-                "rtsp_path": None,
-            }
-            save_baseline(ip, upgraded)
-            print(f"[INFO] Upgraded old baseline format for {ip}")
-            return upgraded
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        remove_baseline(ip)
+        return None
+    if isinstance(data, list):
+        # Auto-upgrade very old format (list of usernames) to new format
+        upgraded = {
+            "users": data,
+            "password": "",
+            "port": None,
+            "rtsp_port": None,
+            "rtsp_path": None,
+        }
+        save_baseline(ip, upgraded)
+        print(f"[INFO] Upgraded old baseline format for {ip}")
+        return upgraded
 
-        # Ensure all keys exist for forward compatibility
-        data.setdefault("users", [])
-        data.setdefault("password", "")
-        data.setdefault("port", None)
-        data.setdefault("rtsp_port", None)
-        data.setdefault("rtsp_path", None)
-        return data
+    required_keys = {"users", "password", "port", "rtsp_port", "rtsp_path"}
+    if not required_keys.issubset(data.keys()):
+        remove_baseline(ip)
+        return None
+    return data
 
 
 def save_baseline(ip, data):
@@ -121,10 +130,20 @@ def find_working_credentials(ip, ports, username='admin'):
     if baseline:
         password = baseline.get("password")
         port = baseline.get("port")
-        if password and port and try_onvif_connection(ip, port, username, password):
-            return port, password
+        if password and port:
+            status = try_onvif_connection(ip, port, username, password)
+            if status is True:
+                return port, password
+            if status == "unauthorized":
+                remove_baseline(ip)
+                print(json.dumps({"error": f"Invalid password for {ip}"}))
+                sys.exit(1)
         if password:
             port = find_onvif_port(ip, ports, username=username, password=password)
+            if port == "unauthorized":
+                remove_baseline(ip)
+                print(json.dumps({"error": f"Invalid password for {ip}"}))
+                sys.exit(1)
             if port:
                 return port, password
         # Baseline credentials didn't work; remove stale baseline
@@ -132,6 +151,8 @@ def find_working_credentials(ip, ports, username='admin'):
 
     for password in PASSWORDS:
         port = find_onvif_port(ip, ports, username=username, password=password)
+        if port == "unauthorized":
+            continue
         if port:
             return port, password
     # Nothing worked, ensure baseline is removed
