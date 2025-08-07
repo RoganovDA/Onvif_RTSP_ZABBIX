@@ -41,7 +41,13 @@ except Exception as e:
 
 from urllib.parse import urlparse
 from onvif import ONVIFCamera
+from onvif.exceptions import ONVIFError
 from zeep.exceptions import Fault
+
+# === Новый фикс ===
+os.environ["HOME"] = "/tmp"
+os.environ["TMPDIR"] = "/tmp"
+# ==================
 
 ALLOWED_TIME_DIFF_SECONDS = 120
 PORTS_TO_CHECK = [80, 8000, 8080, 8899, 10554, 10080, 554, 37777, 5000, 443]
@@ -81,13 +87,14 @@ def try_onvif_connection(ip, port, username='admin', password='000000'):
         device_info = devicemgmt_service.GetDeviceInformation()
         if device_info:
             return True
-    except Fault as fault:
-        msg = str(fault)
-        if '401' in msg or 'Unauthorized' in msg:
+    except (Fault, ONVIFError) as err:
+        msg = str(err)
+        msg_lower = msg.lower()
+        if '401' in msg_lower or 'unauthorized' in msg_lower or 'not authorized' in msg_lower:
             return "unauthorized"
-        logging.error("ONVIF Fault on %s:%s - %s", ip, port, msg)
+        logging.error("ONVIF connection error on %s:%s - %s", ip, port, msg)
     except Exception as e:
-        logging.error("ONVIF connection error on %s:%s - %s", ip, port, e, exc_info=True)
+        logging.error("ONVIF connection error on %s:%s - %s", ip, port, e)
     return False
 
 
@@ -248,7 +255,8 @@ def check_rtsp_stream(url, timeout=5, duration=5.0):
             with suppress_stderr():
                 p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
             err_out = (p.stderr or "") + (p.stdout or "")
-            if "401" in err_out or "Unauthorized" in err_out:
+            err_lower = err_out.lower()
+            if "401" in err_lower or "unauthorized" in err_lower or "not authorized" in err_lower:
                 return {"status": "unauthorized"}
         except Exception:
             pass
@@ -309,7 +317,8 @@ def fallback_ffprobe(url, timeout=5):
         with suppress_stderr():
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
         err_out = (p.stderr or "") + (p.stdout or "")
-        if "401" in err_out or "Unauthorized" in err_out:
+        err_lower = err_out.lower()
+        if "401" in err_lower or "unauthorized" in err_lower or "not authorized" in err_lower:
             return {"status": "unauthorized"}
         info = json.loads(p.stdout or "{}")
         if info.get("streams"):
