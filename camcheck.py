@@ -82,11 +82,24 @@ def load_baseline(ip):
     with open(path, "r") as f:
         data = json.load(f)
         if isinstance(data, list):
-            # Auto-upgrade old format (list of usernames) to new format
-            upgraded = {"users": data, "password": ""}
+            # Auto-upgrade very old format (list of usernames) to new format
+            upgraded = {
+                "users": data,
+                "password": "",
+                "port": None,
+                "rtsp_port": None,
+                "rtsp_path": None,
+            }
             save_baseline(ip, upgraded)
             print(f"[INFO] Upgraded old baseline format for {ip}")
             return upgraded
+
+        # Ensure all keys exist for forward compatibility
+        data.setdefault("users", [])
+        data.setdefault("password", "")
+        data.setdefault("port", None)
+        data.setdefault("rtsp_port", None)
+        data.setdefault("rtsp_path", None)
         return data
 
 
@@ -97,17 +110,32 @@ def save_baseline(ip, data):
         json.dump(data, f, indent=2)
 
 
+def remove_baseline(ip):
+    path = os.path.join(AUDIT_DIR, f"{ip}_users.json")
+    if os.path.exists(path):
+        os.remove(path)
+
+
 def find_working_credentials(ip, ports, username='admin'):
     baseline = load_baseline(ip)
-    if baseline and 'password' in baseline and baseline['password']:
-        password = baseline['password']
-        port = find_onvif_port(ip, ports, username=username, password=password)
-        if port:
+    if baseline:
+        password = baseline.get("password")
+        port = baseline.get("port")
+        if password and port and try_onvif_connection(ip, port, username, password):
             return port, password
+        if password:
+            port = find_onvif_port(ip, ports, username=username, password=password)
+            if port:
+                return port, password
+        # Baseline credentials didn't work; remove stale baseline
+        remove_baseline(ip)
+
     for password in PASSWORDS:
         port = find_onvif_port(ip, ports, username=username, password=password)
         if port:
             return port, password
+    # Nothing worked, ensure baseline is removed
+    remove_baseline(ip)
     return None, None
 
 
@@ -401,8 +429,20 @@ def main():
         usernames = [user.Username for user in users] if isinstance(users, list) else []
 
         baseline = load_baseline(address)
+
+        rtsp_port = baseline.get("rtsp_port") if baseline else None
+        rtsp_path = baseline.get("rtsp_path") if baseline else None
+        if not (rtsp_port and rtsp_path):
+            rtsp_port, rtsp_path = get_rtsp_info(camera)
+
         if baseline is None:
-            save_baseline(address, {"users": usernames, "password": password})
+            save_baseline(address, {
+                "users": usernames,
+                "password": password,
+                "port": port,
+                "rtsp_port": rtsp_port,
+                "rtsp_path": rtsp_path,
+            })
             output['NewUsersDetected'] = False
             output['BaselineCreated'] = True
         else:
@@ -410,15 +450,31 @@ def main():
             output['NewUsersDetected'] = len(new_users) > 0
             output['NewUsernames'] = new_users
             output['BaselineCreated'] = False
-            if baseline.get("password") != password:
-                baseline['password'] = password
+            updated = False
+            if (
+                baseline.get("password") != password
+                or baseline.get("port") != port
+                or baseline.get("rtsp_port") != rtsp_port
+                or baseline.get("rtsp_path") != rtsp_path
+            ):
+                baseline.update({
+                    "password": password,
+                    "port": port,
+                    "rtsp_port": rtsp_port,
+                    "rtsp_path": rtsp_path,
+                })
+                updated = True
+            if baseline.get("users") != usernames:
+                baseline["users"] = usernames
+                updated = True
+            if updated:
                 save_baseline(address, baseline)
 
         output['UserCount'] = len(usernames)
 
-        rtsp_port, rtsp_path = get_rtsp_info(camera)
         output['RTSPPort'] = rtsp_port
         output['RTSPPath'] = rtsp_path
+
 
         if rtsp_port and rtsp_path:
             rtsp_url = f"rtsp://{username}:{password}@{address}:{rtsp_port}{rtsp_path}"
