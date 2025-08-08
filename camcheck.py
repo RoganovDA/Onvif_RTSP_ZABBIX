@@ -12,6 +12,8 @@ import contextlib
 import argparse
 import logging
 import shutil
+import select
+import fcntl
 
 pre_parser = argparse.ArgumentParser(add_help=False)
 pre_parser.add_argument("--logfile")
@@ -53,9 +55,41 @@ os.environ["TMPDIR"] = "/tmp"
 ALLOWED_TIME_DIFF_SECONDS = 120
 PORTS_TO_CHECK = [80, 8000, 8080, 8899, 10554, 10080, 554, 37777, 5000, 443]
 PASSWORDS = ["admin", "12345678", "123456"]
+MAX_PASSWORD_ATTEMPTS = 5
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AUDIT_DIR = os.path.join(BASE_DIR, "onvif_audit")
 
+
+def load_progress(ip):
+    path = os.path.join(AUDIT_DIR, f"{ip}_progress.json")
+    if not os.path.exists(path):
+        return {"tried_passwords": []}
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError
+        data.setdefault("tried_passwords", [])
+        return data
+    except Exception:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return {"tried_passwords": []}
+
+
+def save_progress(ip, data):
+    os.makedirs(AUDIT_DIR, exist_ok=True)
+    path = os.path.join(AUDIT_DIR, f"{ip}_progress.json")
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def remove_progress(ip):
+    path = os.path.join(AUDIT_DIR, f"{ip}_progress.json")
+    if os.path.exists(path):
+        os.remove(path)
 
 def safe_call(service, method_name, params=None):
     try:
@@ -93,9 +127,14 @@ def try_onvif_connection(ip, port, username='admin', password='000000'):
         msg_lower = msg.lower()
         if '401' in msg_lower or 'unauthorized' in msg_lower or 'not authorized' in msg_lower:
             return "unauthorized"
+        if 'device is locked' in msg_lower:
+            return "locked"
         logging.error("ONVIF connection error on %s:%s - %s", ip, port, msg)
     except Exception as e:
-        logging.error("ONVIF connection error on %s:%s - %s", ip, port, e)
+        msg = str(e)
+        if 'device is locked' in msg.lower():
+            return "locked"
+        logging.error("ONVIF connection error on %s:%s - %s", ip, port, msg)
     return False
 
 
@@ -108,6 +147,8 @@ def find_onvif_port(ip, ports, username='admin', password='000000', timeout=2):
                     return port
                 if status == "unauthorized":
                     return "unauthorized"
+                if status == "locked":
+                    return "locked"
         except Exception:
             continue
     return None
@@ -124,6 +165,7 @@ def load_baseline(ip):
         remove_baseline(ip)
         return None
     if isinstance(data, list):
+        # Auto-upgrade very old format (list of usernames) to new format
         upgraded = {
             "users": data,
             "password": "",
@@ -157,39 +199,80 @@ def remove_baseline(ip):
 
 def find_working_credentials(ip, ports, username='admin'):
     baseline = load_baseline(ip)
+    progress = load_progress(ip)
+    tried_passwords = progress.get("tried_passwords", [])
+    attempts_this_run = 0
+
+    def mark_tried(pw):
+        nonlocal attempts_this_run
+        if pw not in tried_passwords:
+            tried_passwords.append(pw)
+            attempts_this_run += 1
+            save_progress(ip, {"tried_passwords": tried_passwords})
+
     if baseline:
         password = baseline.get("password")
         port = baseline.get("port")
-        if password and port:
-            status = try_onvif_connection(ip, port, username, password)
-            if status is True:
-                return port, password
-            if status == "unauthorized":
-                remove_baseline(ip)
-                baseline = None
-                password = None
-                port = None
-        if password:
-            port = find_onvif_port(ip, ports, username=username, password=password)
-            if port == "unauthorized":
-                remove_baseline(ip)
-                baseline = None
-                password = None
-            elif port:
-                return port, password
+        if password and password not in tried_passwords:
+            if attempts_this_run >= MAX_PASSWORD_ATTEMPTS:
+                return None, None
+            mark_tried(password)
+            if port:
+                status = try_onvif_connection(ip, port, username, password)
+                if status is True:
+                    remove_progress(ip)
+                    return port, password
+                if status == "locked":
+                    remove_baseline(ip)
+                    return None, None
+                if status == "unauthorized":
+                    remove_baseline(ip)
+                    baseline = None
+                    password = None
+                    port = None
+            if password:
+                port = find_onvif_port(ip, ports, username=username, password=password)
+                if port == "locked":
+                    remove_baseline(ip)
+                    return None, None
+                if port == "unauthorized":
+                    remove_baseline(ip)
+                    baseline = None
+                    password = None
+                elif port:
+                    remove_progress(ip)
+                    return port, password
         remove_baseline(ip)
         baseline = None
         password = None
         port = None
 
     for password in PASSWORDS:
+        if attempts_this_run >= MAX_PASSWORD_ATTEMPTS:
+            break
+        if password in tried_passwords:
+            continue
+        mark_tried(password)
         port = find_onvif_port(ip, ports, username=username, password=password)
+        if port == "locked":
+            return None, None
         if port == "unauthorized":
             continue
         if port:
+            remove_progress(ip)
             return port, password
-    remove_baseline(ip)
+    remaining = [p for p in PASSWORDS if p not in tried_passwords]
+    if not remaining:
+        remove_progress(ip)
+        remove_baseline(ip)
     return None, None
+
+
+
+def normalize_rtsp_path(path):
+    if not path:
+        return None
+    return '/' + path.lstrip('/')
 
 
 def get_rtsp_info(camera):
@@ -207,7 +290,7 @@ def get_rtsp_info(camera):
         stream_uri_request.ProfileToken = profile_token
         uri_info = media_service.GetStreamUri(stream_uri_request)
         parsed_uri = urlparse(uri_info.Uri)
-        return parsed_uri.port, parsed_uri.path
+        return parsed_uri.port, normalize_rtsp_path(parsed_uri.path)
     except Exception:
         return None, None
 
@@ -332,7 +415,16 @@ def fallback_ffprobe(url, timeout=5):
     return {"status": "error"}
 
 
-
+def read_exact(stream, size, poller, timeout):
+    data = bytearray()
+    while len(data) < size:
+        if not poller.poll(timeout * 1000):
+            break
+        chunk = stream.read(size - len(data))
+        if not chunk:
+            break
+        data.extend(chunk)
+    return bytes(data)
 
 
 def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
@@ -388,8 +480,26 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
     if probe.get("status") == "unauthorized":
         return {"status": "unauthorized"}
 
-    width = probe.get("width") or 1280
-    height = probe.get("height") or 720
+    width = probe.get("width")
+    height = probe.get("height")
+
+    if width is None or height is None:
+        with suppress_stderr():
+            cap_dim = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            if cap_dim.isOpened():
+                tmp_w = int(cap_dim.get(cv2.CAP_PROP_FRAME_WIDTH))
+                tmp_h = int(cap_dim.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                if tmp_w > 0 and tmp_h > 0:
+                    width = width or tmp_w
+                    height = height or tmp_h
+                else:
+                    ret_dim, frame_dim = cap_dim.read()
+                    if ret_dim and frame_dim is not None and frame_dim.size > 0:
+                        height, width = frame_dim.shape[:2]
+            cap_dim.release()
+
+    width = width or 1280
+    height = height or 720
 
     try:
         cmd = [
@@ -400,14 +510,23 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
         with suppress_stderr():
             pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
 
+        fcntl.fcntl(pipe.stdout.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
+        poller = select.poll()
+        poller.register(pipe.stdout, select.POLLIN)
+
         frames, sizes, brightness, change_levels = 0, [], [], []
         prev_gray = None
         start_time = time.time()
+        expected_len = width * height * 3
 
         while time.time() - start_time < duration:
-            raw = pipe.stdout.read(width * height * 3)
-            if len(raw) != width * height * 3:
-                continue
+            raw = read_exact(pipe.stdout, expected_len, poller, timeout)
+            actual_len = len(raw)
+            if actual_len != expected_len:
+                logging.warning(
+                    "Expected frame size %d bytes, got %d", expected_len, actual_len
+                )
+                break
             frame = np.frombuffer(raw, np.uint8).reshape((height, width, 3))
             frames += 1
             sizes.append(frame.nbytes)
@@ -418,9 +537,18 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
                 change_levels.append(delta)
             prev_gray = gray
 
+        poller.unregister(pipe.stdout)
         pipe.terminate()
+        try:
+            pipe.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pipe.kill()
+            pipe.wait()
         stderr_data = pipe.stderr.read().decode(errors="ignore") if pipe.stderr else ""
-        pipe.wait()
+        if pipe.stdout:
+            pipe.stdout.close()
+        if pipe.stderr:
+            pipe.stderr.close()
         if "401" in stderr_data or "Unauthorized" in stderr_data:
             return {"status": "unauthorized"}
 
@@ -537,9 +665,10 @@ def main():
             baseline = load_baseline(address)
 
             rtsp_port = baseline.get("rtsp_port") if baseline else None
-            rtsp_path = baseline.get("rtsp_path") if baseline else None
+            rtsp_path = normalize_rtsp_path(baseline.get("rtsp_path")) if baseline else None
             if not (rtsp_port and rtsp_path):
                 rtsp_port, rtsp_path = get_rtsp_info(camera)
+            rtsp_path = normalize_rtsp_path(rtsp_path)
 
             if baseline is None:
                 save_baseline(address, {
