@@ -42,7 +42,7 @@ except Exception as e:
     print(json.dumps({"error": "NumPy library not installed"}))
     sys.exit(3)
 
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from onvif import ONVIFCamera
 from onvif.exceptions import ONVIFError
 from zeep.exceptions import Fault
@@ -275,6 +275,11 @@ def normalize_rtsp_path(path):
     return '/' + path.lstrip('/')
 
 
+def escape_rtsp_url(url):
+    """Escape potentially unsafe characters in RTSP URLs."""
+    return quote(url, safe=':/?&=@[]%')
+
+
 def get_rtsp_info(camera):
     try:
         media_service = camera.create_media_service()
@@ -309,6 +314,7 @@ def suppress_stderr():
             os.close(saved_stderr_fd)
 
 def check_rtsp_stream(url, timeout=5, duration=5.0):
+    url = escape_rtsp_url(url)
     start_time = time.time()
     result = {
         "status": "error",
@@ -386,6 +392,7 @@ def check_rtsp_stream(url, timeout=5, duration=5.0):
 
 
 def fallback_ffprobe(url, timeout=5):
+    url = escape_rtsp_url(url)
     cmd = [
         "ffprobe", "-v", "error",
         "-rtsp_transport", "tcp",
@@ -428,6 +435,7 @@ def read_exact(stream, size, poller, timeout):
 
 
 def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
+    url = escape_rtsp_url(url)
     result = {
         "status": "error",
         "frames_read": 0,
