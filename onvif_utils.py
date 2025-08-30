@@ -1,5 +1,6 @@
 import datetime
 import logging
+import re
 import socket
 import time
 from urllib.parse import urlparse, quote
@@ -62,6 +63,19 @@ def error_matches(err, keywords):
     return False
 
 
+LOCK_RE = re.compile(r"after\s+(\d+)\s*(second|minute|hour)", re.IGNORECASE)
+
+
+def parse_lock_time(message):
+    match = LOCK_RE.search(message)
+    if not match:
+        return None
+    value = int(match.group(1))
+    unit = match.group(2).lower()
+    factors = {"second": 1, "minute": 60, "hour": 3600}
+    return value * factors.get(unit, 1)
+
+
 def try_onvif_connection(ip, port, username=DEFAULT_USERNAME, password=DEFAULT_PASSWORD):
     try:
         camera = ONVIFCamera(ip, port, username, password)
@@ -70,23 +84,21 @@ def try_onvif_connection(ip, port, username=DEFAULT_USERNAME, password=DEFAULT_P
         if users:
             return True
     except (Fault, ONVIFError) as err:
-        if error_matches(err, ["notauthorized", "unauthorized"]):
-            return "unauthorized"
-        if error_matches(err, ["locked", "devicelocked", "passwordlocked", "accountlocked"]):
-            return "locked"
         msg = str(err)
         msg_lower = msg.lower()
-        if any(x in msg_lower for x in ["401", "unauthorized", "not authorized"]):
+        if error_matches(err, ["notauthorized", "unauthorized"]) or any(
+            x in msg_lower for x in ["401", "unauthorized", "not authorized"]
+        ):
             return "unauthorized"
-        if "lock" in msg_lower:
-            return "locked"
+        if error_matches(err, ["locked", "devicelocked", "passwordlocked", "accountlocked"]) or "lock" in msg_lower:
+            seconds = parse_lock_time(msg) or 31 * 60
+            return ("locked", seconds)
         logging.error("ONVIF connection error on %s:%s - %s", ip, port, msg)
     except Exception as err:
-        if error_matches(err, ["locked", "devicelocked", "passwordlocked", "accountlocked"]):
-            return "locked"
         msg = str(err)
-        if "lock" in msg.lower():
-            return "locked"
+        if error_matches(err, ["locked", "devicelocked", "passwordlocked", "accountlocked"]) or "lock" in msg.lower():
+            seconds = parse_lock_time(msg) or 31 * 60
+            return ("locked", seconds)
         logging.error("ONVIF connection error on %s:%s - %s", ip, port, msg)
     return False
 
@@ -98,6 +110,8 @@ def find_onvif_port(ip, ports, username=DEFAULT_USERNAME, password=DEFAULT_PASSW
                 status = try_onvif_connection(ip, port, username, password)
                 if status is True:
                     return port
+                if isinstance(status, tuple) and status[0] == "locked":
+                    return status
                 if status == "unauthorized":
                     return "unauthorized"
                 if status == "locked":
@@ -112,6 +126,17 @@ def find_working_credentials(ip, ports, username=DEFAULT_USERNAME, password=None
     progress = load_progress(ip)
     tried_passwords = progress.get("tried_passwords", [])
     attempts_this_run = 0
+
+    def record_lock(seconds):
+        next_allowed = datetime.datetime.utcnow() + datetime.timedelta(seconds=seconds)
+        save_progress(
+            ip,
+            {
+                "tried_passwords": tried_passwords,
+                "next_allowed": next_allowed.isoformat(),
+            },
+        )
+        return None, None
 
     def mark_tried(pw):
         nonlocal attempts_this_run
@@ -132,17 +157,22 @@ def find_working_credentials(ip, ports, username=DEFAULT_USERNAME, password=None
                 status = try_onvif_connection(ip, port, username, password)
                 if status is True:
                     return port, password
+                if isinstance(status, tuple) and status[0] == "locked":
+                    remove_baseline(ip)
+                    return record_lock(status[1])
                 if status == "locked":
                     remove_baseline(ip)
-                    return None, None
+                    return record_lock(31 * 60)
                 if status == "unauthorized":
                     remove_baseline(ip)
                     port = None
         if not port:
             port = find_onvif_port(ip, ports, username=username, password=password)
+            if isinstance(port, tuple) and port[0] == "locked":
+                return record_lock(port[1])
             if port in ("locked", "unauthorized", None):
                 if port == "locked":
-                    return None, None
+                    return record_lock(31 * 60)
                 return None, None
         return port, password
 
@@ -159,9 +189,12 @@ def find_working_credentials(ip, ports, username=DEFAULT_USERNAME, password=None
                 status = try_onvif_connection(ip, port, username, baseline_password)
                 if status is True:
                     return port, baseline_password
+                if isinstance(status, tuple) and status[0] == "locked":
+                    remove_baseline(ip)
+                    return record_lock(status[1])
                 if status == "locked":
                     remove_baseline(ip)
-                    return None, None
+                    return record_lock(31 * 60)
                 if status == "unauthorized":
                     remove_baseline(ip)
                     baseline = None
@@ -169,9 +202,12 @@ def find_working_credentials(ip, ports, username=DEFAULT_USERNAME, password=None
                     port = None
             if baseline_password:
                 port = find_onvif_port(ip, ports, username=username, password=baseline_password)
+                if isinstance(port, tuple) and port[0] == "locked":
+                    remove_baseline(ip)
+                    return record_lock(port[1])
                 if port == "locked":
                     remove_baseline(ip)
-                    return None, None
+                    return record_lock(31 * 60)
                 if port == "unauthorized":
                     remove_baseline(ip)
                     baseline = None
@@ -190,8 +226,10 @@ def find_working_credentials(ip, ports, username=DEFAULT_USERNAME, password=None
             continue
         mark_tried(pw)
         port = find_onvif_port(ip, ports, username=username, password=pw)
+        if isinstance(port, tuple) and port[0] == "locked":
+            return record_lock(port[1])
         if port == "locked":
-            return None, None
+            return record_lock(31 * 60)
         if port == "unauthorized":
             continue
         if port:

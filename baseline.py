@@ -43,7 +43,7 @@ AUDIT_DIR = os.path.join(BASE_DIR, "onvif_audit")
 def load_progress(ip):
     path = os.path.join(AUDIT_DIR, f"{ip}_progress.json")
     if not os.path.exists(path):
-        return {"tried_passwords": []}
+        return {"tried_passwords": [], "next_allowed": None}
     try:
         with open(path, "r+", encoding="utf-8") as f:
             flock(f, LOCK_EX)
@@ -54,13 +54,15 @@ def load_progress(ip):
         if not isinstance(data, dict):
             raise ValueError
         data.setdefault("tried_passwords", [])
+        if not isinstance(data.get("next_allowed"), str):
+            data["next_allowed"] = None
         return data
     except Exception:
         try:
             os.remove(path)
         except OSError:
             pass
-        return {"tried_passwords": []}
+        return {"tried_passwords": [], "next_allowed": None}
 
 
 def save_progress(ip, data):
@@ -71,8 +73,18 @@ def save_progress(ip, data):
         with open(path, "a+", encoding="utf-8") as lock_file:
             flock(lock_file, LOCK_EX)
             try:
+                lock_file.seek(0)
+                try:
+                    existing = json.load(lock_file)
+                    if not isinstance(existing, dict):
+                        existing = {}
+                except Exception:
+                    existing = {}
+                existing.update({k: v for k, v in data.items() if v is not None})
+                if "next_allowed" in data and data.get("next_allowed") is None:
+                    existing.pop("next_allowed", None)
                 with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
+                    json.dump(existing, f, indent=2, ensure_ascii=False)
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp_path, path)
