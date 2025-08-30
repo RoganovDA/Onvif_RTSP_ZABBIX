@@ -1,6 +1,9 @@
 # ONVIF/RTSP Camera Audit Script
 
-Скрипт для автоматического аудита IP-камер с поддержкой ONVIF и RTSP.  
+A script for automatic auditing of IP cameras with ONVIF and RTSP support.
+Designed for integration with **Zabbix** monitoring via external scripts.
+
+Скрипт для автоматического аудита IP-камер с поддержкой ONVIF и RTSP.
 Для интеграции с системами мониторинга **Zabbix** через внешние обработки.
 
 ---
@@ -146,6 +149,12 @@
 | `PASSWORDS` | Список известных паролей для подбора | `["admin", "12345678", "000000"]` |
 | `ALLOWED_TIME_DIFF_SECONDS` | Допустимое расхождение времени UTC, сек | `120` |
 | `PORTS_TO_CHECK` | Список портов для проверки ONVIF | `[80, 8000, 8080, 8899, 10554, 10080, 554, 37777, 5000, 443]` |
+| `MAX_PASSWORD_ATTEMPTS` | Максимальное число попыток подбора пароля | `5` |
+| `MAX_MAIN_ATTEMPTS` | Максимальное число основных попыток соединения | `3` |
+| `RTSP_PATH_CANDIDATES` | Список типовых RTSP-путей при отсутствии данных от ONVIF | `["/Streaming/Channels/101", "/h264", "/live", "/stream1"]` |
+| `DEFAULT_RTSP_PORT` | RTSP-порт по умолчанию | `554` |
+| `CV2_OPEN_TIMEOUT_MS` | Таймаут открытия RTSP в OpenCV, мс | `5000` |
+| `CV2_READ_TIMEOUT_MS` | Таймаут чтения кадра в OpenCV, мс | `5000` |
 
 ---
 
