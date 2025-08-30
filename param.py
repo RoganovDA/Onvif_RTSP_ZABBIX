@@ -1,7 +1,13 @@
 # Central configuration for camcheck parameters
 
+# Default username used for login attempts
+DEFAULT_USERNAME = "admin"
+
+# Default password used for initial connection attempts
+DEFAULT_PASSWORD = "000000"
+
 # Candidate passwords to try for ONVIF authentication
-PASSWORDS = ["admin", "12345678"]
+PASSWORDS = ["admin", "12345678", DEFAULT_PASSWORD]
 
 # Maximum number of password attempts per run
 MAX_PASSWORD_ATTEMPTS = 5
@@ -14,12 +20,6 @@ MAX_MAIN_ATTEMPTS = 3
 
 # Allowed time drift between camera and current time (seconds)
 ALLOWED_TIME_DIFF_SECONDS = 120
-
-# Default username used for login attempts
-DEFAULT_USERNAME = "admin"
-
-# Default password used for initial connection attempts
-DEFAULT_PASSWORD = "000000"
 
 # Candidate RTSP paths probed when ONVIF does not provide one
 RTSP_PATH_CANDIDATES = ["/Streaming/Channels/101", "/h264", "/live", "/stream1"]
