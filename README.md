@@ -1,8 +1,5 @@
 # ONVIF/RTSP Camera Audit Script
 
-A script for automatic auditing of IP cameras with ONVIF and RTSP support.
-Designed for integration with **Zabbix** monitoring via external scripts.
-
 Скрипт для автоматического аудита IP-камер с поддержкой ONVIF и RTSP.
 Для интеграции с системами мониторинга **Zabbix** через внешние обработки.
 
