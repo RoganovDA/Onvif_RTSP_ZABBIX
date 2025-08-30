@@ -62,8 +62,38 @@ def suppress_stderr():
             os.close(saved_stderr_fd)
 
 
-def check_rtsp_stream(url, timeout=5, duration=5.0):
+def analyze_frames(cap, duration):
     start_time = time.time()
+    frames, sizes, brightness, change_levels = 0, [], [], []
+    prev_gray = None
+    width = height = None
+
+    while time.time() - start_time < duration:
+        ret, frame = cap.read()
+        if not ret or frame is None or frame.size == 0:
+            time.sleep(0.05)
+            continue
+        frames += 1
+        sizes.append(frame.nbytes)
+        height, width = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        brightness.append(np.mean(gray))
+        if prev_gray is not None:
+            delta = np.mean(np.abs(gray.astype("int16") - prev_gray.astype("int16")))
+            change_levels.append(delta)
+        prev_gray = gray
+
+    return {
+        "frames": frames,
+        "sizes": sizes,
+        "brightness": brightness,
+        "change_levels": change_levels,
+        "width": width,
+        "height": height,
+    }
+
+
+def check_rtsp_stream(url, timeout=5, duration=5.0):
     result = {
         "status": "error",
         "frames_read": 0,
@@ -109,40 +139,21 @@ def check_rtsp_stream(url, timeout=5, duration=5.0):
 
         logging.info("OpenCV using %s backend for %s", backend, mask_credentials(url))
 
-        frames, sizes, brightness, change_levels = 0, [], [], []
-        prev_gray = None
-        width = height = None
-
-        while time.time() - start_time < duration:
-            ret, frame = cap.read()
-            if not ret or frame is None or frame.size == 0:
-                time.sleep(0.05)
-                continue
-
-            frames += 1
-            sizes.append(frame.nbytes)
-            height, width = frame.shape[:2]
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            brightness.append(np.mean(gray))
-
-            if prev_gray is not None:
-                delta = np.mean(np.abs(gray.astype("int16") - prev_gray.astype("int16")))
-                change_levels.append(delta)
-
-            prev_gray = gray
-
+        stats = analyze_frames(cap, duration)
         cap.release()
 
+    frames = stats["frames"]
+    width = stats["width"]
+    height = stats["height"]
     if frames > 0 and width is not None and height is not None:
         result.update({
             "status": "ok",
             "frames_read": frames,
-            "avg_frame_size_kb": round(sum(sizes) / len(sizes) / 1024, 2),
+            "avg_frame_size_kb": round(sum(stats["sizes"]) / len(stats["sizes"]) / 1024, 2),
             "width": width,
             "height": height,
-            "avg_brightness": round(np.mean(brightness), 2),
-            "frame_change_level": round(np.mean(change_levels), 2) if change_levels else 0.0,
+            "avg_brightness": round(np.mean(stats["brightness"]), 2),
+            "frame_change_level": round(np.mean(stats["change_levels"]), 2) if stats["change_levels"] else 0.0,
             "real_fps": round(frames / duration, 2),
             "note": "",
         })
@@ -217,10 +228,14 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
             "real_fps": 0.0,
             "note": "Failed to open stream",
         }
-        start_time = time.time()
-        frames, sizes, brightness, change_levels = 0, [], [], []
-        prev_gray = None
-
+        stats = {
+            "frames": 0,
+            "sizes": [],
+            "brightness": [],
+            "change_levels": [],
+            "width": None,
+            "height": None,
+        }
         old_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{transport}"
         try:
@@ -255,20 +270,7 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
                     backend,
                     mask_credentials(rtsp_url),
                 )
-                while time.time() - start_time < duration:
-                    ret, frame = cap.read()
-                    if not ret or frame is None or frame.size == 0:
-                        time.sleep(0.05)
-                        continue
-                    frames += 1
-                    sizes.append(frame.nbytes)
-                    h, w = frame.shape[:2]
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    brightness.append(np.mean(gray))
-                    if prev_gray is not None:
-                        delta = np.mean(np.abs(gray.astype("int16") - prev_gray.astype("int16")))
-                        change_levels.append(delta)
-                    prev_gray = gray
+                stats = analyze_frames(cap, duration)
                 cap.release()
         finally:
             if old_opts is None:
@@ -276,16 +278,16 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
             else:
                 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = old_opts
 
-        if frames > 0:
+        if stats["frames"] > 0:
             result.update({
                 "status": "ok",
-                "frames_read": frames,
-                "avg_frame_size_kb": round(sum(sizes) / len(sizes) / 1024, 2),
-                "width": w,
-                "height": h,
-                "avg_brightness": round(np.mean(brightness), 2),
-                "frame_change_level": round(np.mean(change_levels), 2) if change_levels else 0.0,
-                "real_fps": round(frames / duration, 2),
+                "frames_read": stats["frames"],
+                "avg_frame_size_kb": round(sum(stats["sizes"]) / len(stats["sizes"]) / 1024, 2),
+                "width": stats["width"],
+                "height": stats["height"],
+                "avg_brightness": round(np.mean(stats["brightness"]), 2),
+                "frame_change_level": round(np.mean(stats["change_levels"]), 2) if stats["change_levels"] else 0.0,
+                "real_fps": round(stats["frames"] / duration, 2),
                 "note": "Read via OpenCV",
             })
             return result

@@ -108,7 +108,7 @@ def find_onvif_port(ip, ports, username=DEFAULT_USERNAME, password=DEFAULT_PASSW
     return None
 
 
-def find_working_credentials(ip, ports, username=DEFAULT_USERNAME):
+def find_working_credentials(ip, ports, username=DEFAULT_USERNAME, password=None):
     baseline = load_baseline(ip)
     progress = load_progress(ip)
     tried_passwords = progress.get("tried_passwords", [])
@@ -121,13 +121,14 @@ def find_working_credentials(ip, ports, username=DEFAULT_USERNAME):
             attempts_this_run += 1
             save_progress(ip, {"tried_passwords": tried_passwords})
 
-    if baseline:
-        password = baseline.get("password")
-        port = baseline.get("port")
-        if password and password not in tried_passwords:
-            if attempts_this_run >= MAX_PASSWORD_ATTEMPTS:
-                return None, None
+    if password is not None:
+        if attempts_this_run >= MAX_PASSWORD_ATTEMPTS:
+            return None, None
+        if password not in tried_passwords:
             mark_tried(password)
+        port = None
+        if baseline:
+            port = baseline.get("port")
             if port:
                 status = try_onvif_connection(ip, port, username, password)
                 if status is True:
@@ -137,38 +138,65 @@ def find_working_credentials(ip, ports, username=DEFAULT_USERNAME):
                     return None, None
                 if status == "unauthorized":
                     remove_baseline(ip)
-                    baseline = None
-                    password = None
                     port = None
-            if password:
-                port = find_onvif_port(ip, ports, username=username, password=password)
+        if not port:
+            port = find_onvif_port(ip, ports, username=username, password=password)
+            if port in ("locked", "unauthorized", None):
+                if port == "locked":
+                    return None, None
+                return None, None
+        return port, password
+
+    baseline_password = None
+    port = None
+    if baseline:
+        baseline_password = baseline.get("password")
+        port = baseline.get("port")
+        if baseline_password and baseline_password not in tried_passwords:
+            if attempts_this_run >= MAX_PASSWORD_ATTEMPTS:
+                return None, None
+            mark_tried(baseline_password)
+            if port:
+                status = try_onvif_connection(ip, port, username, baseline_password)
+                if status is True:
+                    return port, baseline_password
+                if status == "locked":
+                    remove_baseline(ip)
+                    return None, None
+                if status == "unauthorized":
+                    remove_baseline(ip)
+                    baseline = None
+                    baseline_password = None
+                    port = None
+            if baseline_password:
+                port = find_onvif_port(ip, ports, username=username, password=baseline_password)
                 if port == "locked":
                     remove_baseline(ip)
                     return None, None
                 if port == "unauthorized":
                     remove_baseline(ip)
                     baseline = None
-                    password = None
+                    baseline_password = None
                 elif port:
-                    return port, password
+                    return port, baseline_password
         remove_baseline(ip)
         baseline = None
-        password = None
+        baseline_password = None
         port = None
 
-    for password in PASSWORDS:
+    for pw in PASSWORDS:
         if attempts_this_run >= MAX_PASSWORD_ATTEMPTS:
             break
-        if password in tried_passwords:
+        if pw in tried_passwords:
             continue
-        mark_tried(password)
-        port = find_onvif_port(ip, ports, username=username, password=password)
+        mark_tried(pw)
+        port = find_onvif_port(ip, ports, username=username, password=pw)
         if port == "locked":
             return None, None
         if port == "unauthorized":
             continue
         if port:
-            return port, password
+            return port, pw
     remaining = [p for p in PASSWORDS if p not in tried_passwords]
     if not remaining:
         remove_baseline(ip)

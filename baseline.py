@@ -3,12 +3,31 @@ import json
 import logging
 
 if os.name == "nt":
-    import msvcrt
-    LOCK_EX = msvcrt.LK_LOCK
-    LOCK_UN = msvcrt.LK_UNLCK
+    try:
+        import portalocker
 
-    def flock(f, flag):
-        msvcrt.locking(f.fileno(), flag, 1)
+        LOCK_EX = portalocker.LOCK_EX
+        LOCK_UN = portalocker.LOCK_UN
+
+        def flock(f, flag):
+            if flag == LOCK_UN:
+                portalocker.unlock(f)
+            else:
+                portalocker.lock(f, flag)
+    except ImportError:
+        import msvcrt
+
+        LOCK_EX = msvcrt.LK_LOCK
+        LOCK_UN = msvcrt.LK_UNLCK
+
+        def flock(f, flag):
+            size = os.path.getsize(f.name)
+            try:
+                if size == 0:
+                    raise OSError("Cannot lock empty file")
+                msvcrt.locking(f.fileno(), flag, size)
+            except OSError as e:
+                logging.warning("Locking failed for %s: %s", f.name, e)
 else:
     import fcntl
     LOCK_EX = fcntl.LOCK_EX
