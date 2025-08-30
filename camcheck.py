@@ -33,13 +33,13 @@ try:
     import cv2
     if hasattr(cv2, "utils") and hasattr(cv2.utils, "logging"):
         cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
-except Exception as e:
+except Exception:
     print(json.dumps({"error": "OpenCV (cv2) library not installed"}))
     sys.exit(2)
 
 try:
-    import numpy as np
-except Exception as e:
+    import numpy as np  # noqa: F401
+except Exception:
     print(json.dumps({"error": "NumPy library not installed"}))
     sys.exit(3)
 
