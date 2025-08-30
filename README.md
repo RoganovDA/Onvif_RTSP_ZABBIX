@@ -60,11 +60,11 @@
 3. Поместить скрипт в директорию `externalscripts` Zabbix сервера:
     ```bash
     wget https://github.com/RoganovDA/Onvif_RTSP_ZABBIX/archive/refs/heads/main.zip -O Onvif_RTSP_ZABBIX.zip && unzip Onvif_RTSP_ZABBIX.zip && cd Onvif_RTSP_ZABBIX-main
-    cp camcheck.py param.py /usr/lib/zabbix/externalscripts/
+    cp camcheck.py baseline.py param.py /usr/lib/zabbix/externalscripts/
     chmod +x /usr/lib/zabbix/externalscripts/camcheck.py
     mkdir /usr/lib/zabbix/externalscripts/onvif_audit
     sudo chown zabbix:zabbix /usr/lib/zabbix/externalscripts/onvif_audit
-    sudo chown zabbix:zabbix /usr/lib/zabbix/externalscripts/camcheck.py /usr/lib/zabbix/externalscripts/param.py
+    sudo chown zabbix:zabbix /usr/lib/zabbix/externalscripts/camcheck.py /usr/lib/zabbix/externalscripts/baseline.py /usr/lib/zabbix/externalscripts/param.py
     ```
 
 ---
@@ -115,6 +115,15 @@
     "note": ""
 }
 ```
+
+---
+
+## Базовая линия пользователей
+
+Скрипт сохраняет найденных пользователей, пароль и параметры подключения в каталог
+`onvif_audit`. Для каждой камеры создаются файлы `<IP>_users.json` и
+`<IP>_progress.json`, позволяющие отслеживать изменения учётных записей и не
+повторять уже проверенные пароли.
 
 ---
 
