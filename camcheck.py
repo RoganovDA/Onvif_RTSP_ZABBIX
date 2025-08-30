@@ -49,6 +49,8 @@ from baseline import (
     save_baseline,
     remove_baseline,
     remove_progress,
+    load_progress,
+    save_progress,
 )
 from onvif_utils import (
     safe_call,
@@ -126,6 +128,32 @@ def main():
         sys.exit(5)
     username = args.username or DEFAULT_USERNAME
 
+    progress = load_progress(address)
+    next_allowed = progress.get("next_allowed")
+    if next_allowed:
+        try:
+            na_dt = datetime.datetime.fromisoformat(next_allowed)
+            if datetime.datetime.utcnow() < na_dt:
+                print(
+                    json.dumps(
+                        {
+                            "error": "Camera locked, retry later",
+                            "next_allowed": next_allowed,
+                        }
+                    )
+                )
+                sys.exit(1)
+            else:
+                save_progress(
+                    address,
+                    {
+                        "tried_passwords": progress.get("tried_passwords", []),
+                        "next_allowed": None,
+                    },
+                )
+        except Exception:
+            pass
+
     missing_bins = [b for b in ("ffprobe", "ffmpeg") if shutil.which(b) is None]
     if missing_bins:
         msg = f"Missing executables: {', '.join(missing_bins)}"
@@ -139,7 +167,11 @@ def main():
                 address, PORTS_TO_CHECK, username=username, password=args.password
             )
             if port is None:
-                print(json.dumps({"error": f"Unable to find working credentials for {address}"}))
+                progress = load_progress(address)
+                err = {"error": f"Unable to find working credentials for {address}"}
+                if progress.get("next_allowed"):
+                    err["next_allowed"] = progress["next_allowed"]
+                print(json.dumps(err))
                 sys.exit(1)
 
             try:
