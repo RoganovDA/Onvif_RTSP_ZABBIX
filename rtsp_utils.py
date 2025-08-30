@@ -1,16 +1,15 @@
-import os
-import sys
-import json
-import subprocess
-import time
-import logging
-import re
 import contextlib
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import time
 
 import cv2
 import numpy as np
 
-from urllib.parse import quote
 from param import CV2_OPEN_TIMEOUT_MS, CV2_READ_TIMEOUT_MS
 
 if os.name == "nt":

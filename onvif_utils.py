@@ -10,7 +10,6 @@ from zeep.exceptions import Fault
 
 from baseline import (
     load_baseline,
-    save_baseline,
     remove_baseline,
     load_progress,
     save_progress,
