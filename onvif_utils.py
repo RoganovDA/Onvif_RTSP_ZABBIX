@@ -129,7 +129,7 @@ def _classify_category(status: Optional[int], message: str, *, exc: Any = None) 
         return "timeout"
     if any(keyword in text for keyword in LOCK_KEYWORDS):
         return "locked"
-    if status in (401, 403) or "notauthorized" in text or "unauthorized" in text:
+    if status in (401, 403) or "notauthorized" in text or "unauthorized" in text or "not authorized" in text or "requires authorization" in text or "authorization required" in text:
         return "unauthorized"
     if status in (400, 404) or "novalidoperation" in text:
         return "not_supported"
