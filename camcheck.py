@@ -110,21 +110,44 @@ def _summarize_rtsp_result(result):
                 return key
         return None
 
-    for attempt in attempts:
-        attempt_dict = attempt or {}
-        status = _normalize_attempt_status(attempt_dict.get("status"))
-        if not status:
-            status = _normalize_attempt_status(attempt_dict.get("probe_status"))
+    def _select_status(status_value, probe_value):
+        status = _normalize_attempt_status(status_value)
+        probe_status = _normalize_attempt_status(probe_value)
+
+        if probe_status and probe_status != status:
+            if status in (None, "ERROR"):
+                status = probe_status
+            elif probe_status in {"UNAUTHORIZED", "TIMEOUT", "REFUSED", "DNS_FAIL"}:
+                status = probe_status
+
         if not status:
             status = "ERROR"
+
+        return status
+
+    summarized_attempts = []
+    for attempt in attempts:
+        attempt_dict = dict(attempt or {})
+        status = _select_status(attempt_dict.get("status"), attempt_dict.get("probe_status"))
+        attempt_dict["normalized_status"] = status
+        summarized_attempts.append(attempt_dict)
         counts[status] += 1
-    counts["TOTAL"] = len(attempts)
+
+    counts["TOTAL"] = len(summarized_attempts)
+    best_attempt = result.get("best_attempt")
+    if best_attempt:
+        best_attempt = dict(best_attempt)
+        best_attempt["normalized_status"] = _select_status(
+            best_attempt.get("status"), best_attempt.get("probe_status")
+        )
+
     summary = {
         "counts": counts,
-        "best_attempt": result.get("best_attempt"),
+        "best_attempt": best_attempt,
         "status": result.get("status"),
         "note": result.get("note"),
     }
+
     payload = {
         "status": result.get("status"),
         "note": result.get("note"),
@@ -135,8 +158,8 @@ def _summarize_rtsp_result(result):
         "avg_brightness": result.get("avg_brightness"),
         "frame_change_level": result.get("frame_change_level"),
         "real_fps": result.get("real_fps"),
-        "attempts": attempts,
-        "best_attempt": result.get("best_attempt"),
+        "attempts": summarized_attempts,
+        "best_attempt": best_attempt,
         "summary": summary,
     }
     return payload
