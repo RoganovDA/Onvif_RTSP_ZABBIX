@@ -375,124 +375,134 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
                             height, width = frame_dim.shape[:2]
                 cap_dim.release()
 
+        result_payload = {
+            "status": "error",
+            "frames_read": 0,
+            "avg_frame_size_kb": 0.0,
+            "width": width,
+            "height": height,
+            "avg_brightness": 0.0,
+            "frame_change_level": 0.0,
+            "real_fps": 0.0,
+            "note": "Unable to determine stream resolution",
+        }
+
         if width is None or height is None:
-            note = "Unable to determine stream resolution"
-            attempt.update({"status": "ERROR", "method": "ffprobe", "note": note})
-            return {"status": "error", "note": note}, attempt
-
-        try:
-            cmd = [
-                "ffmpeg",
-                "-rtsp_transport",
-                transport,
-                "-i",
-                rtsp_url,
-                "-loglevel",
-                "error",
-                "-an",
-                "-c:v",
-                "rawvideo",
-                "-pix_fmt",
-                "bgr24",
-                "-f",
-                "rawvideo",
-                "-",
-            ]
-            with suppress_stderr():
-                pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10 ** 8)
-
-            set_nonblock(pipe.stdout.fileno())
-            poller = new_poller()
-            poll_register(poller, pipe.stdout)
-
-            frames, sizes, brightness, change_levels = 0, [], [], []
-            prev_gray = None
-            start_time = time.time()
-            expected_len = width * height * 3
-
-            while time.time() - start_time < duration:
-                raw = read_exact(pipe.stdout, expected_len, poller, timeout)
-                actual_len = len(raw)
-                if actual_len != expected_len:
-                    logging.warning(
-                        "Expected frame size %d bytes, got %d", expected_len, actual_len
-                    )
-                    break
-                frame = np.frombuffer(raw, np.uint8).reshape((height, width, 3))
-                frames += 1
-                sizes.append(frame.nbytes)
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                brightness.append(np.mean(gray))
-                if prev_gray is not None:
-                    delta = np.mean(np.abs(gray.astype("int16") - prev_gray.astype("int16")))
-                    change_levels.append(delta)
-                prev_gray = gray
-
-            poller.unregister(pipe.stdout)
-            pipe.terminate()
+            attempt.update({"status": "ERROR", "method": "ffprobe", "note": result_payload["note"]})
+        else:
             try:
-                pipe.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pipe.kill()
-                pipe.wait()
-            stderr_data = pipe.stderr.read().decode(errors="ignore") if pipe.stderr else ""
-            if pipe.stdout:
-                pipe.stdout.close()
-            if pipe.stderr:
-                pipe.stderr.close()
-            if "401" in stderr_data or "Unauthorized" in stderr_data:
-                attempt.update({"status": "UNAUTHORIZED", "method": "ffmpeg", "note": stderr_data.strip() or None})
-                return {"status": "unauthorized"}, attempt
+                cmd = [
+                    "ffmpeg",
+                    "-rtsp_transport",
+                    transport,
+                    "-i",
+                    rtsp_url,
+                    "-loglevel",
+                    "error",
+                    "-an",
+                    "-c:v",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "bgr24",
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ]
+                with suppress_stderr():
+                    pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10 ** 8)
 
-            if frames > 0:
-                if stderr_data:
+                set_nonblock(pipe.stdout.fileno())
+                poller = new_poller()
+                poll_register(poller, pipe.stdout)
+
+                frames, sizes, brightness, change_levels = 0, [], [], []
+                prev_gray = None
+                start_time = time.time()
+                expected_len = width * height * 3
+
+                while time.time() - start_time < duration:
+                    raw = read_exact(pipe.stdout, expected_len, poller, timeout)
+                    actual_len = len(raw)
+                    if actual_len != expected_len:
+                        logging.warning(
+                            "Expected frame size %d bytes, got %d", expected_len, actual_len
+                        )
+                        break
+                    frame = np.frombuffer(raw, np.uint8).reshape((height, width, 3))
+                    frames += 1
+                    sizes.append(frame.nbytes)
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    brightness.append(np.mean(gray))
+                    if prev_gray is not None:
+                        delta = np.mean(np.abs(gray.astype("int16") - prev_gray.astype("int16")))
+                        change_levels.append(delta)
+                    prev_gray = gray
+
+                poller.unregister(pipe.stdout)
+                pipe.terminate()
+                try:
+                    pipe.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pipe.kill()
+                    pipe.wait()
+                stderr_data = pipe.stderr.read().decode(errors="ignore") if pipe.stderr else ""
+                if pipe.stdout:
+                    pipe.stdout.close()
+                if pipe.stderr:
+                    pipe.stderr.close()
+                if "401" in stderr_data or "Unauthorized" in stderr_data:
+                    attempt.update({"status": "UNAUTHORIZED", "method": "ffmpeg", "note": stderr_data.strip() or None})
+                    return {"status": "unauthorized"}, attempt
+
+                if frames > 0:
+                    if stderr_data:
+                        logging.warning(
+                            "ffmpeg stderr for %s: %s",
+                            mask_credentials(rtsp_url),
+                            stderr_data.strip(),
+                        )
+                    result_payload.update({
+                        "status": "ok",
+                        "frames_read": frames,
+                        "avg_frame_size_kb": round(sum(sizes) / len(sizes) / 1024, 2),
+                        "width": width,
+                        "height": height,
+                        "avg_brightness": round(np.mean(brightness), 2),
+                        "frame_change_level": round(np.mean(change_levels) if change_levels else 0.0, 2),
+                        "real_fps": round(frames / duration, 2),
+                        "note": "Read via ffmpeg pipe",
+                    })
+                    attempt.update({"status": "OK", "method": "ffmpeg", "note": result_payload["note"]})
+                else:
+                    logging.warning(
+                        "ffmpeg produced no frames for %s",
+                        mask_credentials(rtsp_url),
+                    )
                     logging.warning(
                         "ffmpeg stderr for %s: %s",
                         mask_credentials(rtsp_url),
                         stderr_data.strip(),
                     )
-                result.update({
-                    "status": "ok",
-                    "frames_read": frames,
-                    "avg_frame_size_kb": round(sum(sizes) / len(sizes) / 1024, 2),
-                    "width": width,
-                    "height": height,
-                    "avg_brightness": round(np.mean(brightness), 2),
-                    "frame_change_level": round(np.mean(change_levels) if change_levels else 0.0, 2),
-                    "real_fps": round(frames / duration, 2),
-                    "note": "Read via ffmpeg pipe",
-                })
-                attempt.update({"status": "OK", "method": "ffmpeg", "note": result["note"]})
-            else:
-                logging.warning(
-                    "ffmpeg produced no frames for %s",
-                    mask_credentials(rtsp_url),
-                )
-                logging.warning(
-                    "ffmpeg stderr for %s: %s",
-                    mask_credentials(rtsp_url),
-                    stderr_data.strip(),
-                )
-                result["note"] = "Connected but no valid frames from ffmpeg"
-                attempt.update({"status": "ERROR", "method": "ffmpeg", "note": result["note"]})
+                    result_payload["note"] = "Connected but no valid frames from ffmpeg"
+                    attempt.update({"status": "ERROR", "method": "ffmpeg", "note": result_payload["note"]})
 
-        except Exception as e:
-            stderr = ""
-            if "pipe" in locals() and pipe.stderr:
-                stderr = pipe.stderr.read().decode(errors="ignore")
+            except Exception as e:
+                stderr = ""
+                if "pipe" in locals() and pipe.stderr:
+                    stderr = pipe.stderr.read().decode(errors="ignore")
+                    logging.error(
+                        "ffmpeg stderr for %s: %s",
+                        mask_credentials(rtsp_url),
+                        stderr.strip(),
+                    )
                 logging.error(
-                    "ffmpeg stderr for %s: %s",
+                    "ffmpeg fallback error for %s: %s",
                     mask_credentials(rtsp_url),
-                    stderr.strip(),
+                    e,
+                    exc_info=True,
                 )
-            logging.error(
-                "ffmpeg fallback error for %s: %s",
-                mask_credentials(rtsp_url),
-                e,
-                exc_info=True,
-            )
-            result["note"] = f"ffmpeg error: {e}"
-            attempt.update({"status": "ERROR", "method": "ffmpeg", "note": result["note"]})
+                result_payload["note"] = f"ffmpeg error: {e}"
+                attempt.update({"status": "ERROR", "method": "ffmpeg", "note": result_payload["note"]})
 
         status_map = {
             "ok": "OK",
@@ -505,7 +515,7 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
             attempt["status"] = status_map[probe_status]
             if not attempt.get("note"):
                 attempt["note"] = probe.get("error")
-        return result, attempt
+        return result_payload, attempt
 
     attempts = []
     best_result = None
