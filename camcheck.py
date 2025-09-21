@@ -60,8 +60,23 @@ def validate_address(address, timeout=5):
                 socket.setdefaulttimeout(original)
 
 
-def is_reachable(address, timeout):
-    for port in (80, 554):
+def is_reachable(address, timeout, ports=None):
+    port_list = []
+    if ports:
+        for value in ports:
+            try:
+                port = int(value)
+            except (TypeError, ValueError):
+                continue
+            if port <= 0:
+                continue
+            port_list.append(port)
+    port_list.extend([80, 554])
+    seen = set()
+    for port in port_list:
+        if port in seen:
+            continue
+        seen.add(port)
         try:
             with socket.create_connection((address, port), timeout=timeout):
                 return True
@@ -406,12 +421,21 @@ def main():
     if not valid:
         print(json.dumps({"error": err_msg or "Invalid address"}))
         sys.exit(1)
-    if not is_reachable(address, args.ping_timeout):
+
+    baseline = load_baseline(address)
+    reachability_hints = []
+    if baseline:
+        reachability_hints.extend(
+            value for value in (baseline.get("port"), baseline.get("rtsp_port"))
+        )
+    reachability_hints.extend(PORTS_TO_CHECK)
+    reachability_hints.append(DEFAULT_RTSP_PORT)
+    reachability_ports = _unique_preserve(reachability_hints)
+    if not is_reachable(address, args.ping_timeout, ports=reachability_ports):
         print(json.dumps({"error": "Host unreachable"}))
         sys.exit(5)
 
     username = args.username or DEFAULT_USERNAME
-    baseline = load_baseline(address)
     progress = load_progress(address)
     now = datetime.datetime.utcnow()
 
