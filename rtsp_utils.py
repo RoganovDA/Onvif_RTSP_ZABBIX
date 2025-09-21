@@ -8,8 +8,15 @@ import sys
 import time
 from urllib.parse import urlparse
 
-import cv2
 import numpy as np
+
+try:
+    import cv2  # type: ignore
+except Exception as exc:  # pragma: no cover - import guard
+    cv2 = None  # type: ignore
+    CV2_IMPORT_ERROR = exc
+else:  # pragma: no cover - simple assignment
+    CV2_IMPORT_ERROR = None
 
 from param import CV2_OPEN_TIMEOUT_MS, CV2_READ_TIMEOUT_MS
 
@@ -76,10 +83,13 @@ def analyze_frames(cap, duration):
         frames += 1
         sizes.append(frame.nbytes)
         height, width = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        brightness.append(np.mean(gray))
+        gray = _convert_to_gray(frame)
+        if gray is None:
+            continue
+        gray = gray.astype(np.float32, copy=False)
+        brightness.append(float(np.mean(gray)))
         if prev_gray is not None:
-            delta = np.mean(np.abs(gray.astype("int16") - prev_gray.astype("int16")))
+            delta = float(np.mean(np.abs(gray - prev_gray)))
             change_levels.append(delta)
         prev_gray = gray
 
@@ -91,6 +101,18 @@ def analyze_frames(cap, duration):
         "width": width,
         "height": height,
     }
+
+
+def _convert_to_gray(frame):
+    if frame is None:
+        return None
+    if cv2 is not None:
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if frame.ndim < 3 or frame.shape[-1] < 3:
+        return frame.astype(np.float32, copy=False)
+    channels = frame[..., :3].astype(np.float32, copy=False)
+    weights = np.array([0.114, 0.587, 0.299], dtype=np.float32)
+    return np.tensordot(channels, weights, axes=([-1], [0]))
 
 
 def check_rtsp_stream(url, timeout=5, duration=5.0):
@@ -105,6 +127,23 @@ def check_rtsp_stream(url, timeout=5, duration=5.0):
         "real_fps": 0.0,
         "note": "Unable to determine stream resolution",
     }
+
+    if cv2 is None:
+        logging.warning("OpenCV not available for direct RTSP check: %s", CV2_IMPORT_ERROR)
+        probe = fallback_ffprobe(url, timeout, "tcp")
+        if probe.get("status") == "unauthorized":
+            return {"status": "unauthorized"}
+        note = probe.get("error") or probe.get("note") or result["note"]
+        if probe.get("status") == "ok":
+            result.update({
+                "status": "ok",
+                "width": probe.get("width"),
+                "height": probe.get("height"),
+                "note": note or "Read via ffprobe",
+            })
+        else:
+            result["note"] = note or result["note"]
+        return result
 
     with suppress_stderr():
         cap = cv2.VideoCapture(url)
@@ -289,48 +328,54 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
             "width": None,
             "height": None,
         }
-        old_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{transport}"
         probe_status = None
-        try:
-            with suppress_stderr():
-                cap = cv2.VideoCapture(rtsp_url)
-                backend = "default"
-                if not cap.isOpened():
-                    cap.release()
-                    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-                    backend = "CAP_FFMPEG"
-            if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT"):
-                if not cap.set(cv2.CAP_PROP_OPEN_TIMEOUT, CV2_OPEN_TIMEOUT_MS):
-                    logging.warning("Failed to set CAP_PROP_OPEN_TIMEOUT")
-            else:
-                logging.warning("CAP_PROP_OPEN_TIMEOUT not supported")
-            if hasattr(cv2, "CAP_PROP_READ_TIMEOUT"):
-                if not cap.set(cv2.CAP_PROP_READ_TIMEOUT, CV2_READ_TIMEOUT_MS):
-                    logging.warning("Failed to set CAP_PROP_READ_TIMEOUT")
-            else:
-                logging.warning("CAP_PROP_READ_TIMEOUT not supported")
+        if cv2 is not None:
+            old_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{transport}"
+            try:
+                with suppress_stderr():
+                    cap = cv2.VideoCapture(rtsp_url)
+                    backend = "default"
+                    if not cap.isOpened():
+                        cap.release()
+                        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+                        backend = "CAP_FFMPEG"
+                if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT"):
+                    if not cap.set(cv2.CAP_PROP_OPEN_TIMEOUT, CV2_OPEN_TIMEOUT_MS):
+                        logging.warning("Failed to set CAP_PROP_OPEN_TIMEOUT")
+                else:
+                    logging.warning("CAP_PROP_OPEN_TIMEOUT not supported")
+                if hasattr(cv2, "CAP_PROP_READ_TIMEOUT"):
+                    if not cap.set(cv2.CAP_PROP_READ_TIMEOUT, CV2_READ_TIMEOUT_MS):
+                        logging.warning("Failed to set CAP_PROP_READ_TIMEOUT")
+                else:
+                    logging.warning("CAP_PROP_READ_TIMEOUT not supported")
 
-            if not cap.isOpened():
-                logging.error(
-                    "OpenCV could not open stream %s using %s backend",
-                    mask_credentials(rtsp_url),
-                    backend,
-                )
-                cap.release()
-            else:
-                logging.info(
-                    "OpenCV using %s backend for %s",
-                    backend,
-                    mask_credentials(rtsp_url),
-                )
-                stats = analyze_frames(cap, duration)
-                cap.release()
-        finally:
-            if old_opts is None:
-                os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
-            else:
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = old_opts
+                if not cap.isOpened():
+                    logging.error(
+                        "OpenCV could not open stream %s using %s backend",
+                        mask_credentials(rtsp_url),
+                        backend,
+                    )
+                    cap.release()
+                else:
+                    logging.info(
+                        "OpenCV using %s backend for %s",
+                        backend,
+                        mask_credentials(rtsp_url),
+                    )
+                    stats = analyze_frames(cap, duration)
+                    cap.release()
+            finally:
+                if old_opts is None:
+                    os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+                else:
+                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = old_opts
+        else:
+            logging.warning(
+                "OpenCV is not available, skipping direct capture: %s",
+                CV2_IMPORT_ERROR,
+            )
 
         if stats["frames"] > 0:
             result.update({
@@ -358,22 +403,25 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
         height = probe.get("height")
 
         if width is None or height is None:
-            with suppress_stderr():
-                cap_dim = cv2.VideoCapture(rtsp_url)
-                if not cap_dim.isOpened():
+            if cv2 is not None:
+                with suppress_stderr():
+                    cap_dim = cv2.VideoCapture(rtsp_url)
+                    if not cap_dim.isOpened():
+                        cap_dim.release()
+                        cap_dim = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+                    if cap_dim.isOpened():
+                        tmp_w = int(cap_dim.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        tmp_h = int(cap_dim.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        if tmp_w > 0 and tmp_h > 0:
+                            width = width or tmp_w
+                            height = height or tmp_h
+                        else:
+                            ret_dim, frame_dim = cap_dim.read()
+                            if ret_dim and frame_dim is not None and frame_dim.size > 0:
+                                height, width = frame_dim.shape[:2]
                     cap_dim.release()
-                    cap_dim = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-                if cap_dim.isOpened():
-                    tmp_w = int(cap_dim.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    tmp_h = int(cap_dim.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    if tmp_w > 0 and tmp_h > 0:
-                        width = width or tmp_w
-                        height = height or tmp_h
-                    else:
-                        ret_dim, frame_dim = cap_dim.read()
-                        if ret_dim and frame_dim is not None and frame_dim.size > 0:
-                            height, width = frame_dim.shape[:2]
-                cap_dim.release()
+            else:
+                logging.debug("OpenCV unavailable; cannot query frame dimensions directly")
 
         if width is None or height is None:
             note = "Unable to determine stream resolution"
@@ -421,10 +469,13 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
                 frame = np.frombuffer(raw, np.uint8).reshape((height, width, 3))
                 frames += 1
                 sizes.append(frame.nbytes)
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                brightness.append(np.mean(gray))
+                gray = _convert_to_gray(frame)
+                if gray is None:
+                    continue
+                gray = gray.astype(np.float32, copy=False)
+                brightness.append(float(np.mean(gray)))
                 if prev_gray is not None:
-                    delta = np.mean(np.abs(gray.astype("int16") - prev_gray.astype("int16")))
+                    delta = float(np.mean(np.abs(gray - prev_gray)))
                     change_levels.append(delta)
                 prev_gray = gray
 
