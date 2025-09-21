@@ -18,11 +18,19 @@ from cli import parse_args
 from onvif_utils import (
     find_working_credentials,
     get_rtsp_info,
+    normalize_rtsp_path,
     parse_datetime,
     safe_call,
     try_onvif_connection,
 )
-from param import ALLOWED_TIME_DIFF_SECONDS, DEFAULT_USERNAME, MAX_MAIN_ATTEMPTS, PORTS_TO_CHECK
+from param import (
+    ALLOWED_TIME_DIFF_SECONDS,
+    DEFAULT_RTSP_PORT,
+    DEFAULT_USERNAME,
+    MAX_MAIN_ATTEMPTS,
+    PORTS_TO_CHECK,
+    RTSP_PATH_CANDIDATES,
+)
 from rtsp_utils import check_rtsp_stream_with_fallback
 
 
@@ -105,6 +113,121 @@ def _summarize_rtsp_result(result):
     return payload
 
 
+def _normalize_call_status(call_result):
+    if not isinstance(call_result, dict):
+        return None
+    if call_result.get("success"):
+        return "OK"
+    category = call_result.get("category")
+    mapping = {
+        "unauthorized": "AUTH_REQUIRED",
+        "timeout": "TIMEOUT",
+        "locked": "LOCKED",
+        "not_supported": "NOT_SUPPORTED",
+        "redirect": "REDIRECT",
+    }
+    if category in mapping:
+        return mapping[category]
+    if call_result.get("status") in (401, 403):
+        return "AUTH_REQUIRED"
+    return "ERROR"
+
+
+def _apply_call_status(snapshot, prefix, call_result, warnings, description):
+    status = _normalize_call_status(call_result)
+    if not status or status == "OK":
+        return
+    key = f"{prefix}_auth" if status == "AUTH_REQUIRED" else f"{prefix}_status"
+    snapshot[key] = status
+    error_text = call_result.get("error")
+    if error_text:
+        warnings.append(f"{description}: {error_text}")
+
+
+def _unique_preserve(values):
+    seen = set()
+    ordered = []
+    for value in values:
+        if value is None:
+            continue
+        if value in seen:
+            continue
+        ordered.append(value)
+        seen.add(value)
+    return ordered
+
+
+def _standardize_rtsp_result(result, default_status="error", default_note=""):
+    return {
+        "status": result.get("status", default_status),
+        "note": result.get("note") or default_note,
+        "frames_read": result.get("frames_read", 0),
+        "avg_frame_size_kb": result.get("avg_frame_size_kb", 0.0),
+        "width": result.get("width"),
+        "height": result.get("height"),
+        "avg_brightness": result.get("avg_brightness", 0.0),
+        "frame_change_level": result.get("frame_change_level", 0.0),
+        "real_fps": result.get("real_fps", 0.0),
+        "attempts": result.get("attempts", []),
+        "best_attempt": result.get("best_attempt"),
+    }
+
+
+def _run_rtsp_candidate_fallback(address, username, password, port_candidates, path_candidates):
+    attempts = []
+    best_payload = None
+    best_attempt = None
+
+    for port in port_candidates:
+        for path in path_candidates:
+            normalized_path = normalize_rtsp_path(path)
+            if not normalized_path:
+                continue
+            encoded_path = quote(normalized_path, safe="/?:=&")
+            url = (
+                f"rtsp://{quote(username, safe='')}:{quote(password, safe='')}@"
+                f"{address}:{port}{encoded_path}"
+            )
+            result = check_rtsp_stream_with_fallback(url)
+            result_attempts = result.get("attempts", [])
+            for attempt in result_attempts:
+                attempt_copy = dict(attempt or {})
+                attempt_copy.setdefault("path", normalized_path)
+                attempt_copy["port"] = port
+                attempts.append(attempt_copy)
+            candidate_best = result.get("best_attempt")
+            if candidate_best:
+                candidate_best = dict(candidate_best)
+                candidate_best.setdefault("path", normalized_path)
+                candidate_best["port"] = port
+            standardized = _standardize_rtsp_result(result)
+            if candidate_best:
+                standardized["best_attempt"] = candidate_best
+            status = (standardized.get("status") or "").lower()
+            if status in {"ok", "unauthorized"}:
+                standardized["attempts"] = list(attempts)
+                if candidate_best:
+                    standardized["best_attempt"] = candidate_best
+                elif attempts:
+                    standardized["best_attempt"] = attempts[-1]
+                return standardized
+            if best_payload is None:
+                best_payload = standardized
+                if candidate_best:
+                    best_attempt = candidate_best
+
+    if best_payload is None:
+        best_payload = _standardize_rtsp_result(
+            {"status": "not_available", "note": "No RTSP fallback attempts executed"}
+        )
+    best_payload["attempts"] = list(attempts)
+    if best_attempt:
+        best_payload["best_attempt"] = best_attempt
+    elif attempts:
+        best_payload["best_attempt"] = attempts[-1]
+    return best_payload
+
+
 def _collect_device_snapshot(camera):
     snapshot = {
         "device": {},
@@ -131,7 +254,7 @@ def _collect_device_snapshot(camera):
             "hardware_id": getattr(info, "HardwareId", None),
         }
     else:
-        snapshot["device_error"] = device_info.get("error")
+        _apply_call_status(snapshot, "device", device_info, warnings, "GetDeviceInformation")
 
     interfaces = safe_call(devicemgmt_service, "GetNetworkInterfaces")
     if interfaces.get("success"):
@@ -147,7 +270,7 @@ def _collect_device_snapshot(camera):
                 "ipv4": getattr(from_dhcp, "Address", None) if from_dhcp else None,
             }
     else:
-        snapshot["network_error"] = interfaces.get("error")
+        _apply_call_status(snapshot, "network_interfaces", interfaces, warnings, "GetNetworkInterfaces")
 
     datetime_info = safe_call(devicemgmt_service, "GetSystemDateAndTime")
     if datetime_info.get("success"):
@@ -159,9 +282,10 @@ def _collect_device_snapshot(camera):
                 "in_sync": delta <= ALLOWED_TIME_DIFF_SECONDS,
             }
         else:
-            snapshot["time_error"] = "Unable to parse camera time"
+            snapshot["time_status"] = "ERROR"
+            warnings.append("GetSystemDateAndTime: Unable to parse camera time")
     else:
-        snapshot["time_error"] = datetime_info.get("error")
+        _apply_call_status(snapshot, "time", datetime_info, warnings, "GetSystemDateAndTime")
 
     ntp_info = safe_call(devicemgmt_service, "GetNTP")
     if ntp_info.get("success"):
@@ -184,7 +308,7 @@ def _collect_device_snapshot(camera):
         if dnsname:
             snapshot["network"]["ntp"] = dnsname
     else:
-        snapshot["ntp_error"] = ntp_info.get("error")
+        _apply_call_status(snapshot, "ntp", ntp_info, warnings, "GetNTP")
 
     users_call = safe_call(devicemgmt_service, "GetUsers")
     if users_call.get("success"):
@@ -199,7 +323,7 @@ def _collect_device_snapshot(camera):
             "usernames": usernames,
         }
     else:
-        snapshot["users_error"] = users_call.get("error")
+        _apply_call_status(snapshot, "users", users_call, warnings, "GetUsers")
 
     return snapshot, usernames, warnings
 
@@ -336,28 +460,45 @@ def main():
         if rtsp_path is None and baseline:
             rtsp_path = baseline.get("rtsp_path")
 
-        rtsp_result = {
-            "status": "not_available",
-            "note": "No RTSP URI provided",
-            "frames_read": 0,
-            "avg_frame_size_kb": 0.0,
-            "width": None,
-            "height": None,
-            "avg_brightness": 0.0,
-            "frame_change_level": 0.0,
-            "real_fps": 0.0,
-            "attempts": [],
-        }
-        best_url = None
-        if rtsp_port and rtsp_path:
-            encoded_path = quote(rtsp_path, safe="/?:=&")
-            rtsp_url = f"rtsp://{quote(username, safe='')}:{quote(password, safe='')}@{address}:{rtsp_port}{encoded_path}"
-            rtsp_result = check_rtsp_stream_with_fallback(rtsp_url)
-            best_url = (rtsp_result.get("best_attempt") or {}).get("url")
+        port_candidates = _unique_preserve([
+            rtsp_port,
+            (baseline or {}).get("rtsp_port") if baseline else None,
+            DEFAULT_RTSP_PORT,
+        ])
+        if not port_candidates:
+            port_candidates = [DEFAULT_RTSP_PORT]
+
+        path_candidates = _unique_preserve([
+            rtsp_path,
+            (baseline or {}).get("rtsp_path") if baseline else None,
+            *RTSP_PATH_CANDIDATES,
+        ])
+
+        if path_candidates:
+            rtsp_result = _run_rtsp_candidate_fallback(
+                address,
+                username,
+                password,
+                port_candidates,
+                path_candidates,
+            )
+        else:
+            rtsp_result = _standardize_rtsp_result(
+                {"status": "not_available", "note": "No RTSP path candidates available"}
+            )
+
+        best_url = (rtsp_result.get("best_attempt") or {}).get("url")
         rtsp_phase = _summarize_rtsp_result(rtsp_result)
 
         best_attempt = rtsp_phase.get("best_attempt") or {}
         best_path = best_attempt.get("path")
+        attempt_port = best_attempt.get("port")
+        if rtsp_port is None and isinstance(attempt_port, int):
+            rtsp_port = attempt_port
+        if rtsp_path is None and best_path:
+            rtsp_path = best_path
+        if rtsp_path:
+            rtsp_path = normalize_rtsp_path(rtsp_path)
 
         baseline_users = (baseline or {}).get("users", [])
         user_changes = {}
