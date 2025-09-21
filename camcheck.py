@@ -110,15 +110,23 @@ def _summarize_rtsp_result(result):
                 return key
         return None
 
-    for attempt in attempts:
-        attempt_dict = attempt or {}
+    def _derive_status(attempt_dict):
         status = _normalize_attempt_status(attempt_dict.get("status"))
-        if not status:
-            status = _normalize_attempt_status(attempt_dict.get("probe_status"))
-        if not status:
-            status = "ERROR"
+        probe_status = _normalize_attempt_status(attempt_dict.get("probe_status"))
+        if (not status or status == "ERROR") and probe_status:
+            status = probe_status
+        if status and status not in counts:
+            counts.setdefault(status, 0)
+        return status or "ERROR"
+
+    normalized_attempts = []
+    for attempt in attempts:
+        attempt_dict = dict(attempt or {})
+        status = _derive_status(attempt_dict)
+        attempt_dict["status"] = status
         counts[status] += 1
-    counts["TOTAL"] = len(attempts)
+        normalized_attempts.append(attempt_dict)
+    counts["TOTAL"] = len(normalized_attempts)
     summary = {
         "counts": counts,
         "best_attempt": result.get("best_attempt"),
@@ -135,10 +143,16 @@ def _summarize_rtsp_result(result):
         "avg_brightness": result.get("avg_brightness"),
         "frame_change_level": result.get("frame_change_level"),
         "real_fps": result.get("real_fps"),
-        "attempts": attempts,
+        "attempts": normalized_attempts,
         "best_attempt": result.get("best_attempt"),
         "summary": summary,
     }
+    best_attempt = payload.get("best_attempt")
+    if isinstance(best_attempt, dict):
+        best_copy = dict(best_attempt)
+        best_copy["status"] = _derive_status(best_copy)
+        payload["best_attempt"] = best_copy
+        summary["best_attempt"] = best_copy
     return payload
 
 
