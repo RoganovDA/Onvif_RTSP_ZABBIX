@@ -3,7 +3,7 @@ import logging
 import re
 import socket
 import time
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import quote, urlparse
 
 from onvif import ONVIFCamera
@@ -121,8 +121,12 @@ def parse_lock_time(message: str) -> Optional[int]:
     return value * factors.get(unit, 1)
 
 
-def _classify_category(status: Optional[int], message: str) -> Optional[str]:
+def _classify_category(status: Optional[int], message: str, *, exc: Any = None) -> Optional[str]:
     text = (message or "").lower()
+    if exc and isinstance(exc, (socket.timeout, TimeoutError)):
+        return "timeout"
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
     if any(keyword in text for keyword in LOCK_KEYWORDS):
         return "locked"
     if status in (401, 403) or "notauthorized" in text or "unauthorized" in text:
@@ -139,10 +143,11 @@ def _build_error_result(
     *,
     status: Optional[int] = None,
     redirect: Optional[str] = None,
+    latency_ms: Optional[float] = None,
 ) -> Dict[str, Any]:
     message = str(exc) if exc is not None else ""
     code = _extract_status_code(status if status is not None else exc)
-    category = _classify_category(code, message)
+    category = _classify_category(code, message, exc=exc)
     result: Dict[str, Any] = {
         "success": False,
         "status": code,
@@ -150,11 +155,14 @@ def _build_error_result(
         "category": category,
         "error": message or None,
         "result": None,
+        "latency_ms": latency_ms,
+        "exception": type(exc).__name__ if exc else None,
     }
     if redirect:
         result["redirect"] = redirect
     if isinstance(exc, Fault):
         result["fault_code"] = getattr(exc, "code", None)
+        result["fault_string"] = getattr(exc, "message", None)
     if category == "locked":
         result["lock_seconds"] = parse_lock_time(message) or 31 * 60
     return result
@@ -196,11 +204,17 @@ def _summarize_call(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
         "status_group": result.get("status_group"),
         "category": result.get("category"),
         "error": result.get("error"),
+        "latency_ms": result.get("latency_ms"),
+        "exception": result.get("exception"),
     }
     if "redirect_chain" in result:
         summary["redirect_chain"] = result["redirect_chain"]
     if "lock_seconds" in result:
         summary["lock_seconds"] = result.get("lock_seconds")
+    if "fault_code" in result:
+        summary["fault_code"] = result.get("fault_code")
+    if "fault_string" in result:
+        summary["fault_string"] = result.get("fault_string")
     return summary
 
 
@@ -213,11 +227,13 @@ def safe_call(
 ) -> Dict[str, Any]:
     method = getattr(service, method_name)
     prepared = _build_params(params, service)
+    start = time.perf_counter()
     try:
         if prepared is None:
             response = method()
         else:
             response = method(prepared)
+        latency = round((time.perf_counter() - start) * 1000, 2)
         return {
             "success": True,
             "status": 200,
@@ -225,16 +241,21 @@ def safe_call(
             "result": response,
             "category": None,
             "error": None,
+            "latency_ms": latency,
         }
     except TransportError as err:
         redirect = _extract_redirect(err)
-        result = _build_error_result(err, redirect=redirect)
+        latency = round((time.perf_counter() - start) * 1000, 2)
+        result = _build_error_result(err, redirect=redirect, latency_ms=latency)
     except Fault as err:
-        result = _build_error_result(err)
+        latency = round((time.perf_counter() - start) * 1000, 2)
+        result = _build_error_result(err, latency_ms=latency)
     except ONVIFError as err:
-        result = _build_error_result(err)
+        latency = round((time.perf_counter() - start) * 1000, 2)
+        result = _build_error_result(err, latency_ms=latency)
     except Exception as err:
-        result = _build_error_result(err)
+        latency = round((time.perf_counter() - start) * 1000, 2)
+        result = _build_error_result(err, latency_ms=latency)
 
     redirect_url = result.get("redirect")
     if (
@@ -338,54 +359,92 @@ def _results_to_dict(results: Iterable[Dict[str, Any]]):
     return {_method_key(r["service"], r["method"]): r for r in results}
 
 
-def _combine_method_status(
+def _summarize_phase(
     methods: Iterable[Dict[str, Any]],
-    anonymous: Dict[str, Dict[str, Any]],
-    authenticated: Dict[str, Dict[str, Any]],
-) -> Tuple[List[str], List[str], List[str], Dict[str, Dict[str, Any]], bool, int, int]:
-    open_methods: List[str] = []
-    protected_methods: List[str] = []
-    unsupported_methods: List[str] = []
-    method_status: Dict[str, Dict[str, Any]] = {}
-    any_success = False
-    unauthorized_count = 0
-    executed_methods = 0
+    phase_results: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    methods_list = list(methods)
+    summary: Dict[str, List[str]] = {
+        "open": [],
+        "unauthorized": [],
+        "not_supported": [],
+        "redirect": [],
+        "timeout": [],
+        "locked": [],
+        "errors": [],
+    }
+    methods_info: Dict[str, Dict[str, Any]] = {}
+    latency_total = 0.0
+    latency_count = 0
 
-    for spec in methods:
+    for spec in methods_list:
         key = _method_key(spec["service"], spec["method"])
-        anon_entry = anonymous.get(key)
-        auth_entry = authenticated.get(key)
-        method_status[key] = {
-            "anonymous": _summarize_call(anon_entry),
-            "authenticated": _summarize_call(auth_entry),
-        }
-
-        if auth_entry:
-            executed_methods += 1
-            if auth_entry.get("success"):
-                any_success = True
-                if anon_entry and anon_entry.get("success"):
-                    open_methods.append(key)
-                else:
-                    protected_methods.append(key)
+        call_result = phase_results.get(key)
+        if call_result:
+            summarized = _summarize_call(call_result)
+            methods_info[key] = summarized
+            latency = summarized.get("latency_ms")
+            if isinstance(latency, (int, float)):
+                latency_total += float(latency)
+                latency_count += 1
+            if summarized.get("success"):
+                summary["open"].append(key)
             else:
-                category = auth_entry.get("category")
+                category = summarized.get("category")
                 if category == "unauthorized":
-                    unauthorized_count += 1
-                if category == "not_supported" or auth_entry.get("status") in (400, 404):
-                    unsupported_methods.append(key)
+                    summary["unauthorized"].append(key)
+                elif category == "not_supported":
+                    summary["not_supported"].append(key)
+                elif category == "redirect":
+                    summary["redirect"].append(key)
+                elif category == "timeout":
+                    summary["timeout"].append(key)
+                elif category == "locked":
+                    summary["locked"].append(key)
+                else:
+                    summary["errors"].append(key)
         else:
-            unsupported_methods.append(key)
+            summary["errors"].append(key)
 
-    return (
-        sorted(set(open_methods)),
-        sorted(set(protected_methods)),
-        sorted(set(unsupported_methods)),
-        method_status,
-        any_success,
-        unauthorized_count,
-        executed_methods,
-    )
+    for key, value in summary.items():
+        if isinstance(value, list):
+            summary[key] = sorted(set(value))
+
+    if latency_count:
+        summary["latency_ms_total"] = round(latency_total, 2)
+        summary["latency_ms_avg"] = round(latency_total / latency_count, 2)
+    else:
+        summary["latency_ms_total"] = None
+        summary["latency_ms_avg"] = None
+    summary["attempted_methods"] = len(methods_info)
+    summary["total_methods"] = len(methods_list)
+    summary["counts"] = {
+        "open": len(summary["open"]),
+        "unauthorized": len(summary["unauthorized"]),
+        "not_supported": len(summary["not_supported"]),
+        "redirect": len(summary["redirect"]),
+        "timeout": len(summary["timeout"]),
+        "locked": len(summary["locked"]),
+        "errors": len(summary["errors"]),
+    }
+
+    return {"methods": methods_info, "summary": summary}
+
+
+def _derive_anonymous_verdict(summary: Dict[str, Any]) -> str:
+    if summary["counts"]["locked"]:
+        return "LOCKED"
+    if summary["counts"]["open"]:
+        return "OPEN_ANON"
+    if summary["counts"]["unauthorized"]:
+        return "AUTH_REQUIRED"
+    if summary["counts"]["not_supported"]:
+        return "NOT_SUPPORTED"
+    if summary["counts"]["redirect"]:
+        return "REDIRECT"
+    if summary["counts"]["timeout"]:
+        return "TIMEOUT"
+    return "ERROR"
 
 
 def try_onvif_connection(
@@ -394,21 +453,10 @@ def try_onvif_connection(
     username: str = DEFAULT_USERNAME,
     password: str = DEFAULT_PASSWORD,
 ) -> Dict[str, Any]:
-    report: Dict[str, Any] = {
-        "status": "error",
-        "open_methods": [],
-        "protected_methods": [],
-        "unsupported_methods": [],
-        "anonymous": {},
-        "authenticated": {},
-        "raw_results": {"anonymous": {}, "authenticated": {}},
-        "method_status": {},
-        "errors": [],
-        "lock_seconds": None,
-        "first_success": None,
-    }
+    phase_results: Dict[str, Dict[str, Any]] = {}
+    phase_errors: Dict[str, List[Dict[str, Any]]] = {"anonymous": [], "authenticated": []}
+    lock_seconds: Optional[int] = None
 
-    phase_results = {}
     for phase, user, passwd, encrypt in (
         ("anonymous", "", "", False),
         ("authenticated", username, password, True),
@@ -418,91 +466,176 @@ def try_onvif_connection(
         except (Fault, ONVIFError) as err:
             error_result = _build_error_result(err)
             error_result["phase"] = phase
-            report["errors"].append(error_result)
-            if error_result.get("category") == "locked":
-                report["status"] = "locked"
-                report["lock_seconds"] = error_result.get("lock_seconds")
-            elif phase == "authenticated" and error_result.get("category") == "unauthorized":
-                report["status"] = "unauthorized"
+            phase_errors[phase].append(error_result)
+            if error_result.get("lock_seconds"):
+                value = error_result.get("lock_seconds")
+                if value is not None:
+                    lock_seconds = max(lock_seconds or 0, int(value))
             continue
         except Exception as err:
             error_result = _build_error_result(err)
             error_result["phase"] = phase
-            report["errors"].append(error_result)
+            phase_errors[phase].append(error_result)
             continue
 
         results = _execute_method_sequence(camera, ONVIF_PRIORITY_METHODS)
-        indexed = _results_to_dict(results)
-        phase_results[phase] = indexed
-        report["raw_results"][phase] = indexed
-        report[phase] = {k: _summarize_call(v) for k, v in indexed.items()}
+        phase_results[phase] = _results_to_dict(results)
 
-    authenticated_results = phase_results.get("authenticated", {})
-    anonymous_results = phase_results.get("anonymous", {})
+    anonymous_phase = _summarize_phase(ONVIF_PRIORITY_METHODS, phase_results.get("anonymous", {}))
+    anonymous_phase["summary"]["verdict"] = _derive_anonymous_verdict(anonymous_phase["summary"])
+    anonymous_phase["errors"] = phase_errors.get("anonymous", [])
 
-    (
-        open_methods,
-        protected_methods,
-        unsupported_methods,
-        method_status,
-        any_success,
-        unauthorized_count,
-        executed_methods,
-    ) = _combine_method_status(
-        ONVIF_PRIORITY_METHODS,
-        anonymous_results,
-        authenticated_results,
+    auth_phase = _summarize_phase(ONVIF_PRIORITY_METHODS, phase_results.get("authenticated", {}))
+    auth_phase["errors"] = phase_errors.get("authenticated", [])
+
+    for phase_block in (anonymous_phase, auth_phase):
+        for info in phase_block["methods"].values():
+            value = info.get("lock_seconds")
+            if value:
+                lock_seconds = max(lock_seconds or 0, int(value))
+
+    for err_list in phase_errors.values():
+        for err in err_list:
+            value = err.get("lock_seconds")
+            if value:
+                lock_seconds = max(lock_seconds or 0, int(value))
+
+    critical_keys = {
+        _method_key(spec["service"], spec["method"])
+        for spec in ONVIF_PRIORITY_METHODS
+        if spec.get("critical")
+    }
+    media_keys = {
+        _method_key(spec["service"], spec["method"])
+        for spec in ONVIF_PRIORITY_METHODS
+        if spec.get("target") == "media"
+    }
+    device_keys = {
+        _method_key(spec["service"], spec["method"])
+        for spec in ONVIF_PRIORITY_METHODS
+        if spec.get("target") == "device"
+    }
+
+    auth_results = phase_results.get("authenticated", {})
+    first_success = {"device": None, "media": None}
+    media_denied = False
+    critical_unauthorized: Set[str] = set()
+    critical_not_supported: Set[str] = set()
+    critical_timeout: Set[str] = set()
+
+    for spec in ONVIF_PRIORITY_METHODS:
+        key = _method_key(spec["service"], spec["method"])
+        entry = auth_results.get(key)
+        if not entry:
+            continue
+        if entry.get("success"):
+            target = spec.get("target")
+            if target in first_success and first_success[target] is None:
+                first_success[target] = key
+        else:
+            category = entry.get("category")
+            if category == "unauthorized":
+                if spec.get("target") == "media":
+                    media_denied = True
+                if spec.get("critical"):
+                    critical_unauthorized.add(key)
+            if category == "not_supported" and spec.get("critical"):
+                critical_not_supported.add(key)
+            if category == "timeout" and spec.get("critical"):
+                critical_timeout.add(key)
+        if entry.get("lock_seconds"):
+            lock_seconds = max(lock_seconds or 0, int(entry.get("lock_seconds")))
+
+    def _has_category(items: Iterable[Dict[str, Any]], category: str) -> bool:
+        return any((item or {}).get("category") == category for item in items)
+
+    locked_detected = (
+        anonymous_phase["summary"]["counts"]["locked"]
+        or auth_phase["summary"]["counts"]["locked"]
+        or _has_category(anonymous_phase.get("errors", []), "locked")
+        or _has_category(auth_phase.get("errors", []), "locked")
     )
 
-    report["open_methods"] = open_methods
-    report["protected_methods"] = protected_methods
-    report["unsupported_methods"] = unsupported_methods
-    report["method_status"] = method_status
+    auth_summary = auth_phase["summary"]
+    auth_open = set(auth_summary["open"])
+    auth_unauthorized = set(auth_summary["unauthorized"])
+    auth_not_supported = set(auth_summary["not_supported"])
+    auth_timeout = set(auth_summary["timeout"])
+    auth_errors = set(auth_summary["errors"])
+    error_categories = {
+        err.get("category")
+        for err in auth_phase.get("errors", [])
+        if err.get("category")
+    }
 
-    for key in ONVIF_PRIORITY_METHODS:
-        mkey = _method_key(key["service"], key["method"])
-        auth_entry = authenticated_results.get(mkey)
-        if report.get("first_success") is None and auth_entry and auth_entry.get("success"):
-            report["first_success"] = mkey
-
-    if report["status"] == "locked":
-        return report
-
-    if report["status"] == "unauthorized" and any_success:
-        report["status"] = "success"
-
-    if any_success:
-        report["status"] = "success"
-    elif report["status"] != "unauthorized":
-        total_methods = len(ONVIF_PRIORITY_METHODS)
-        if unsupported_methods and len(set(unsupported_methods)) >= total_methods:
-            report["status"] = "not_supported"
-        elif executed_methods and unauthorized_count == executed_methods:
-            report["status"] = "unauthorized"
-        elif not executed_methods:
-            report["status"] = "error"
+    if locked_detected:
+        final_verdict = "LOCKED"
+    elif auth_summary["attempted_methods"] == 0:
+        if "unauthorized" in error_categories:
+            final_verdict = "WRONG_CREDS"
         else:
-            # Preserve earlier status if set, otherwise generic error
-            if report["status"] not in ("locked", "unauthorized"):
-                report["status"] = report["status"] if report["status"] != "error" else "error"
+            final_verdict = "LIMITED_ONVIF"
+    else:
+        if not auth_open:
+            if auth_unauthorized or "unauthorized" in error_categories:
+                final_verdict = "WRONG_CREDS"
+            elif auth_not_supported and not (auth_timeout or auth_errors):
+                final_verdict = "LIMITED_ONVIF"
+            elif auth_timeout or "timeout" in error_categories:
+                final_verdict = "LIMITED_ONVIF"
+            else:
+                final_verdict = "LIMITED_ONVIF"
+        else:
+            if auth_unauthorized or "unauthorized" in error_categories:
+                final_verdict = "INSUFFICIENT_ROLE"
+            elif media_denied:
+                final_verdict = "INSUFFICIENT_ROLE"
+            elif critical_not_supported or critical_timeout:
+                final_verdict = "LIMITED_ONVIF"
+            elif not first_success.get("media") and media_keys:
+                final_verdict = "LIMITED_ONVIF"
+            else:
+                final_verdict = "AUTH_OK"
 
-    if report["status"] == "unauthorized":
-        logging.debug(
-            "ONVIF authentication failed for %s:%s (unauthorized)",
-            ip,
-            port,
-        )
-    elif report["status"] == "success":
-        logging.debug(
-            "ONVIF authentication succeeded for %s:%s via %s",
-            ip,
-            port,
-            report.get("first_success"),
-        )
-    elif report["status"] == "not_supported":
-        logging.debug(
-            "ONVIF methods unsupported on %s:%s", ip, port
-        )
+    auth_phase["summary"]["verdict"] = final_verdict
+
+    services = {
+        "device": {
+            "first_success": first_success.get("device"),
+            "open": sorted(auth_open & device_keys),
+            "unauthorized": sorted(auth_unauthorized & device_keys),
+            "not_supported": sorted(auth_not_supported & device_keys),
+        },
+        "media": {
+            "first_success": first_success.get("media"),
+            "open": sorted(auth_open & media_keys),
+            "unauthorized": sorted(auth_unauthorized & media_keys),
+            "not_supported": sorted(auth_not_supported & media_keys),
+            "denied": media_denied,
+        },
+    }
+
+    critical_summary = {
+        "unauthorized": sorted(critical_unauthorized),
+        "not_supported": sorted(critical_not_supported),
+        "timeout": sorted(critical_timeout),
+    }
+
+    report = {
+        "final_verdict": final_verdict,
+        "phase": {
+            "anonymous": anonymous_phase,
+            "authenticated": auth_phase,
+        },
+        "services": services,
+        "critical": critical_summary,
+        "lock_seconds": lock_seconds,
+        "anonymous_exposure": anonymous_phase["summary"].get("open", []),
+        "media_denied": media_denied,
+        "first_success": first_success,
+        "errors": phase_errors["anonymous"] + phase_errors["authenticated"],
+    }
+
     return report
 
 
@@ -518,20 +651,25 @@ def find_onvif_port(
         try:
             with socket.create_connection((ip, port), timeout=timeout):
                 report = try_onvif_connection(ip, port, username, password)
-                status = report.get("status")
-                if status == "success":
-                    report["port"] = port
-                    return {"status": "success", "port": port, "report": report}
-                if status == "locked":
+                verdict = report.get("final_verdict")
+                if verdict == "LOCKED":
                     return {
                         "status": "locked",
                         "port": port,
                         "lock_seconds": report.get("lock_seconds", 31 * 60),
                         "report": report,
                     }
-                if status == "unauthorized":
-                    last_unauthorized = {"status": "unauthorized", "port": port, "report": report}
-                # Skip unsupported/error ports and continue probing
+                if verdict == "WRONG_CREDS":
+                    last_unauthorized = {
+                        "status": "unauthorized",
+                        "port": port,
+                        "report": report,
+                    }
+                    continue
+                if verdict in {"AUTH_OK", "INSUFFICIENT_ROLE", "LIMITED_ONVIF"}:
+                    report["port"] = port
+                    return {"status": "success", "port": port, "report": report}
+                # All other outcomes: continue probing
         except Exception:
             continue
     return last_unauthorized or {"status": "not_found"}
@@ -567,14 +705,12 @@ def find_working_credentials(
             save_progress(ip, {"tried_passwords": tried_passwords})
 
     def evaluate_report(port, pw, report):
-        status = report.get("status")
-        if status == "success":
+        verdict = report.get("final_verdict")
+        if verdict in {"AUTH_OK", "INSUFFICIENT_ROLE", "LIMITED_ONVIF"}:
             return port, pw, report
-        if status == "locked":
+        if verdict == "LOCKED":
             return record_lock(report.get("lock_seconds", 31 * 60))
-        if status == "unauthorized":
-            return None, None, None
-        if status == "not_supported":
+        if verdict == "WRONG_CREDS":
             return None, None, None
         return None, None, None
 
@@ -592,10 +728,10 @@ def find_working_credentials(
                 result = evaluate_report(port, password, report)
                 if result[0]:
                     return result
-                if report and report.get("status") == "locked":
+                if report and report.get("final_verdict") == "LOCKED":
                     remove_baseline(ip)
                     return record_lock(report.get("lock_seconds", 31 * 60))
-                if report and report.get("status") == "unauthorized":
+                if report and report.get("final_verdict") == "WRONG_CREDS":
                     remove_baseline(ip)
                     port = None
         if not port:
@@ -623,10 +759,10 @@ def find_working_credentials(
                 result = evaluate_report(port, baseline_password, report)
                 if result[0]:
                     return result
-                if report and report.get("status") == "locked":
+                if report and report.get("final_verdict") == "LOCKED":
                     remove_baseline(ip)
                     return record_lock(report.get("lock_seconds", 31 * 60))
-                if report and report.get("status") == "unauthorized":
+                if report and report.get("final_verdict") == "WRONG_CREDS":
                     remove_baseline(ip)
                     baseline_password = None
                     port = None
