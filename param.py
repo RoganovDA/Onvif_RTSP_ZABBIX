@@ -30,3 +30,21 @@ DEFAULT_RTSP_PORT = 554
 # OpenCV capture timeout settings in milliseconds
 CV2_OPEN_TIMEOUT_MS = 5000
 CV2_READ_TIMEOUT_MS = 5000
+
+# Ordered list of ONVIF methods that are probed during authentication and
+# capability discovery.  Each entry specifies the service constructor name,
+# method name and optional static parameters that should be supplied.  This
+# ordered list allows the authentication helper to short-circuit as soon as a
+# method returns a valid response, while still providing insight into which
+# calls are accessible anonymously.
+ONVIF_PRIORITY_METHODS = [
+    {"service": "devicemgmt", "method": "GetDeviceInformation", "params": None},
+    {"service": "devicemgmt", "method": "GetSystemDateAndTime", "params": None},
+    {"service": "devicemgmt", "method": "GetCapabilities", "params": {"Category": "All"}},
+    {"service": "devicemgmt", "method": "GetScopes", "params": None},
+    {"service": "devicemgmt", "method": "GetNetworkInterfaces", "params": None},
+    {"service": "devicemgmt", "method": "GetNTP", "params": None},
+    {"service": "devicemgmt", "method": "GetDNS", "params": None},
+    {"service": "devicemgmt", "method": "GetUsers", "params": None},
+    {"service": "media", "method": "GetProfiles", "params": None},
+]
