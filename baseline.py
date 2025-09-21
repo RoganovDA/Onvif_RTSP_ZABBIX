@@ -129,6 +129,14 @@ def load_baseline(ip):
             "protected_methods": [],
             "unsupported_methods": [],
             "method_status": {},
+            "last_auth_status": None,
+            "lockout_until": None,
+            "lockout_message": None,
+            "last_endpoints": {},
+            "last_good_stream_uri": None,
+            "rtsp_best_path": None,
+            "cooldown_until": None,
+            "rtsp_attempts": [],
         }
         save_baseline(ip, upgraded)
         logging.info("Upgraded old baseline format for %s", ip)
@@ -137,10 +145,27 @@ def load_baseline(ip):
     if not required_keys.issubset(data.keys()):
         remove_baseline(ip)
         return None
-    data.setdefault("open_methods", [])
-    data.setdefault("protected_methods", [])
-    data.setdefault("unsupported_methods", [])
-    data.setdefault("method_status", {})
+    defaults = {
+        "open_methods": [],
+        "protected_methods": [],
+        "unsupported_methods": [],
+        "method_status": {},
+        "last_auth_status": None,
+        "lockout_until": None,
+        "lockout_message": None,
+        "last_endpoints": {},
+        "last_good_stream_uri": None,
+        "rtsp_best_path": None,
+        "cooldown_until": None,
+        "rtsp_attempts": [],
+    }
+    for key, default in defaults.items():
+        if key not in data or data[key] is None:
+            data[key] = default
+    if not isinstance(data.get("last_endpoints"), dict):
+        data["last_endpoints"] = {}
+    if not isinstance(data.get("rtsp_attempts"), list):
+        data["rtsp_attempts"] = []
     return data
 
 

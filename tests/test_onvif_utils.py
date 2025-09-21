@@ -1,7 +1,10 @@
+import os
 import sys
 import types
 import unittest
 from unittest.mock import patch
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from zeep.exceptions import Fault
 
@@ -87,17 +90,30 @@ class TryOnvifConnectionTests(unittest.TestCase):
     @patch(
         "onvif_utils.ONVIF_PRIORITY_METHODS",
         [
-            {"service": "devicemgmt", "method": "Foo", "params": None},
-            {"service": "devicemgmt", "method": "Bar", "params": None},
+            {
+                "service": "devicemgmt",
+                "method": "Foo",
+                "params": None,
+                "critical": True,
+                "target": "device",
+            },
+            {
+                "service": "devicemgmt",
+                "method": "Bar",
+                "params": None,
+                "critical": True,
+                "target": "device",
+            },
         ],
     )
     def test_not_supported_method_does_not_mark_unauthorized(self):
         report = onvif_utils.try_onvif_connection("127.0.0.1", 80, "admin", "password")
-        self.assertEqual(report["status"], "success")
-        self.assertIn("devicemgmt.Bar", report["protected_methods"])
-        self.assertIn("devicemgmt.Foo", report["unsupported_methods"])
-        method_status = report["method_status"]["devicemgmt.Foo"]["authenticated"]
-        self.assertEqual(method_status["category"], "not_supported")
+        self.assertEqual(report["final_verdict"], "LIMITED_ONVIF")
+        methods = report["phase"]["authenticated"]["methods"]
+        self.assertIn("devicemgmt.Bar", methods)
+        self.assertTrue(methods["devicemgmt.Bar"]["success"])
+        self.assertEqual(methods["devicemgmt.Foo"]["category"], "not_supported")
+        self.assertIn("devicemgmt.Foo", report["critical"]["not_supported"])
 
 
 if __name__ == "__main__":

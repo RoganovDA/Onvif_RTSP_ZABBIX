@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import time
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -165,26 +166,46 @@ def check_rtsp_stream(url, timeout=5, duration=5.0):
 def fallback_ffprobe(url, timeout=5, transport="tcp"):
     timeout_us = str(int(timeout * 1e6))
     logging.info("ffprobe stimeout=%s", timeout_us)
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-rtsp_transport", transport,
-        "-stimeout", timeout_us,
-        "-i", url,
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,codec_name",
-        "-of", "json",
+
+    base_cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-rtsp_transport",
+        transport,
+        "-i",
+        url,
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,codec_name",
+        "-of",
+        "json",
     ]
-    cmd_log = cmd[:-1] + [mask_credentials(cmd[-1])]
-    logging.debug("Running ffprobe command: %s", " ".join(cmd_log))
-    try:
+
+    def _run(cmd):
+        cmd_log = cmd[:-1] + [mask_credentials(cmd[-1])]
+        logging.debug("Running ffprobe command: %s", " ".join(cmd_log))
         with suppress_stderr():
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
-        err_out = (p.stderr or "") + (p.stdout or "")
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+
+    def _parse_process(proc):
+        err_out = (proc.stderr or "") + (proc.stdout or "")
         logging.debug("ffprobe stderr: %s", err_out.strip())
         err_lower = err_out.lower()
         if "401" in err_lower or "unauthorized" in err_lower or "not authorized" in err_lower:
             return {"status": "unauthorized"}
-        info = json.loads(p.stdout or "{}")
+        if "connection refused" in err_lower:
+            return {"status": "refused", "error": err_out.strip() or None}
+        if "stimeout" not in err_lower and (
+            "timed out" in err_lower or "timeout" in err_lower
+        ):
+            return {"status": "timeout", "error": err_out.strip() or None}
+        if "name or service not known" in err_lower or "unknown host" in err_lower:
+            return {"status": "dns_fail", "error": err_out.strip() or None}
+        if proc.returncode not in (0, None):
+            return {"status": "error", "error": err_out.strip() or None}
+        info = json.loads(proc.stdout or "{}")
         if info.get("streams"):
             stream = info["streams"][0]
             return {
@@ -192,9 +213,34 @@ def fallback_ffprobe(url, timeout=5, transport="tcp"):
                 "width": stream.get("width"),
                 "height": stream.get("height"),
             }
+        return {"status": "error", "error": "No streams in ffprobe output"}
+
+    cmd_with_timeout = base_cmd[:]
+    cmd_with_timeout.insert(5, "-stimeout")
+    cmd_with_timeout.insert(6, timeout_us)
+
+    try:
+        proc = _run(cmd_with_timeout)
+        result = _parse_process(proc)
+        err_out = (proc.stderr or "") + (proc.stdout or "")
+        err_lower = (err_out or "").lower()
+        if (
+            "stimeout" in err_lower
+            and (
+                "unrecognized option" in err_lower
+                or "option not found" in err_lower
+            )
+        ):
+            logging.debug("ffprobe lacks -stimeout, retrying without it")
+            proc = _run(base_cmd)
+            return _parse_process(proc)
+        return result
+    except subprocess.TimeoutExpired as exc:
+        logging.error("ffprobe timeout: %s", exc)
+        return {"status": "timeout", "error": str(exc)}
     except Exception as e:
         logging.error("ffprobe error: %s", e, exc_info=True)
-    return {"status": "error"}
+        return {"status": "error", "error": str(e)}
 
 
 def read_exact(stream, size, poller, timeout):
@@ -216,6 +262,14 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
             mask_credentials(rtsp_url),
             transport,
         )
+        attempt = {
+            "transport": transport,
+            "url": mask_credentials(rtsp_url),
+            "path": urlparse(rtsp_url).path or "/",
+            "status": "ERROR",
+            "method": None,
+            "note": None,
+        }
         result = {
             "status": "error",
             "frames_read": 0,
@@ -237,6 +291,7 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
         }
         old_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{transport}"
+        probe_status = None
         try:
             with suppress_stderr():
                 cap = cv2.VideoCapture(rtsp_url)
@@ -285,15 +340,19 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
                 "width": stats["width"],
                 "height": stats["height"],
                 "avg_brightness": round(np.mean(stats["brightness"]), 2),
-                "frame_change_level": round(np.mean(stats["change_levels"]), 2) if stats["change_levels"] else 0.0,
+                "frame_change_level": round(np.mean(stats["change_levels"]) if stats["change_levels"] else 0.0, 2),
                 "real_fps": round(stats["frames"] / duration, 2),
                 "note": "Read via OpenCV",
             })
-            return result
+            attempt.update({"status": "OK", "method": "opencv", "note": result["note"]})
+            return result, attempt
 
         probe = fallback_ffprobe(rtsp_url, timeout, transport)
-        if probe.get("status") == "unauthorized":
-            return {"status": "unauthorized"}
+        probe_status = probe.get("status")
+        attempt["probe_status"] = probe_status
+        if probe_status == "unauthorized":
+            attempt.update({"status": "UNAUTHORIZED", "method": "ffprobe", "note": probe.get("error")})
+            return {"status": "unauthorized"}, attempt
 
         width = probe.get("width")
         height = probe.get("height")
@@ -317,16 +376,30 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
                 cap_dim.release()
 
         if width is None or height is None:
-            return {"status": "error", "note": "Unable to determine stream resolution"}
+            note = "Unable to determine stream resolution"
+            attempt.update({"status": "ERROR", "method": "ffprobe", "note": note})
+            return {"status": "error", "note": note}, attempt
 
         try:
             cmd = [
-                "ffmpeg", "-rtsp_transport", transport, "-i", rtsp_url,
-                "-loglevel", "error", "-an", "-c:v", "rawvideo",
-                "-pix_fmt", "bgr24", "-f", "rawvideo", "-",
+                "ffmpeg",
+                "-rtsp_transport",
+                transport,
+                "-i",
+                rtsp_url,
+                "-loglevel",
+                "error",
+                "-an",
+                "-c:v",
+                "rawvideo",
+                "-pix_fmt",
+                "bgr24",
+                "-f",
+                "rawvideo",
+                "-",
             ]
             with suppress_stderr():
-                pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
+                pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10 ** 8)
 
             set_nonblock(pipe.stdout.fileno())
             poller = new_poller()
@@ -368,7 +441,8 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
             if pipe.stderr:
                 pipe.stderr.close()
             if "401" in stderr_data or "Unauthorized" in stderr_data:
-                return {"status": "unauthorized"}
+                attempt.update({"status": "UNAUTHORIZED", "method": "ffmpeg", "note": stderr_data.strip() or None})
+                return {"status": "unauthorized"}, attempt
 
             if frames > 0:
                 if stderr_data:
@@ -384,10 +458,11 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
                     "width": width,
                     "height": height,
                     "avg_brightness": round(np.mean(brightness), 2),
-                    "frame_change_level": round(np.mean(change_levels), 2) if change_levels else 0.0,
+                    "frame_change_level": round(np.mean(change_levels) if change_levels else 0.0, 2),
                     "real_fps": round(frames / duration, 2),
                     "note": "Read via ffmpeg pipe",
                 })
+                attempt.update({"status": "OK", "method": "ffmpeg", "note": result["note"]})
             else:
                 logging.warning(
                     "ffmpeg produced no frames for %s",
@@ -399,10 +474,11 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
                     stderr_data.strip(),
                 )
                 result["note"] = "Connected but no valid frames from ffmpeg"
+                attempt.update({"status": "ERROR", "method": "ffmpeg", "note": result["note"]})
 
         except Exception as e:
             stderr = ""
-            if 'pipe' in locals() and pipe.stderr:
+            if "pipe" in locals() and pipe.stderr:
                 stderr = pipe.stderr.read().decode(errors="ignore")
                 logging.error(
                     "ffmpeg stderr for %s: %s",
@@ -416,13 +492,43 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
                 exc_info=True,
             )
             result["note"] = f"ffmpeg error: {e}"
+            attempt.update({"status": "ERROR", "method": "ffmpeg", "note": result["note"]})
 
-        return result
+        status_map = {
+            "ok": "OK",
+            "unauthorized": "UNAUTHORIZED",
+            "timeout": "TIMEOUT",
+            "refused": "REFUSED",
+            "dns_fail": "DNS_FAIL",
+        }
+        if attempt["status"] in ("ERROR", None) and probe_status in status_map:
+            attempt["status"] = status_map[probe_status]
+            if not attempt.get("note"):
+                attempt["note"] = probe.get("error")
+        return result, attempt
 
-    last = None
+    attempts = []
+    best_result = None
+    best_attempt = None
+    last_result = None
+
     for transport in ("tcp", "udp"):
         logging.info("Attempting RTSP with transport %s", transport)
-        last = _attempt(url, transport)
-        if last.get("status") in ("ok", "unauthorized"):
-            return last
-    return last
+        result, attempt = _attempt(url, transport)
+        attempts.append(attempt)
+        last_result = result
+        if result.get("status") in {"ok", "unauthorized"}:
+            best_result = result
+            best_attempt = attempt
+            break
+        if best_result is None:
+            best_result = result
+            best_attempt = attempt
+
+    final_result = best_result or last_result or {"status": "error"}
+    final_result = dict(final_result)
+    final_result.setdefault("note", "")
+    final_result["attempts"] = attempts
+    if best_attempt:
+        final_result["best_attempt"] = best_attempt
+    return final_result

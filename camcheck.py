@@ -1,68 +1,29 @@
-#!/usr/bin/python3
-# -*- coding: utf-8 -*-
-
-import sys
-import json
 import datetime
-import os
-import shutil
+import json
 import logging
-import socket
-import ipaddress
+import os
 import re
+import shutil
+import socket
+import sys
+from typing import List
 from urllib.parse import quote
 
 from onvif import ONVIFCamera
-from zeep.exceptions import Fault
 from onvif.exceptions import ONVIFError
+from zeep.exceptions import Fault
 
-# ensure temp dirs
-os.environ["HOME"] = "/tmp"
-os.environ["TMPDIR"] = "/tmp"
-
-# Constants are centralized in param.py
-from param import (
-    ALLOWED_TIME_DIFF_SECONDS,
-    PORTS_TO_CHECK,
-    MAX_MAIN_ATTEMPTS,
-    DEFAULT_USERNAME,
-)
-
-# check dependencies
-try:
-    import cv2
-    if hasattr(cv2, "utils") and hasattr(cv2.utils, "logging"):
-        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
-except Exception:
-    print(json.dumps({"error": "OpenCV (cv2) library not installed"}))
-    sys.exit(2)
-
-try:
-    import numpy as np  # noqa: F401
-except Exception:
-    print(json.dumps({"error": "NumPy library not installed"}))
-    sys.exit(3)
-
+from baseline import load_baseline, load_progress, save_baseline, save_progress, remove_progress
 from cli import parse_args
-from baseline import (
-    load_baseline,
-    save_baseline,
-    remove_baseline,
-    remove_progress,
-    load_progress,
-    save_progress,
-)
 from onvif_utils import (
-    safe_call,
-    parse_datetime,
     find_working_credentials,
     get_rtsp_info,
-    normalize_rtsp_path,
+    parse_datetime,
+    safe_call,
+    try_onvif_connection,
 )
-from rtsp_utils import (
-    check_rtsp_stream_with_fallback,
-    fallback_ffprobe,
-)
+from param import ALLOWED_TIME_DIFF_SECONDS, DEFAULT_USERNAME, MAX_MAIN_ATTEMPTS, PORTS_TO_CHECK
+from rtsp_utils import check_rtsp_stream_with_fallback
 
 
 HOSTNAME_RE = re.compile(r"^[A-Za-z0-9.-]+$")
@@ -71,20 +32,24 @@ HOSTNAME_RE = re.compile(r"^[A-Za-z0-9.-]+$")
 def validate_address(address, timeout=5):
     """Validate IP address or resolvable hostname."""
     try:
-        ipaddress.ip_address(address)
+        socket.inet_pton(socket.AF_INET, address)
         return True, None
-    except ValueError:
-        if not HOSTNAME_RE.fullmatch(address or ""):
-            return False, "Invalid address"
+    except OSError:
         try:
-            original = socket.getdefaulttimeout()
-            socket.setdefaulttimeout(timeout)
-            socket.gethostbyname(address)
+            socket.inet_pton(socket.AF_INET6, address)
             return True, None
-        except socket.gaierror:
-            return False, "DNS resolution failed"
-        finally:
-            socket.setdefaulttimeout(original)
+        except OSError:
+            if not HOSTNAME_RE.fullmatch(address or ""):
+                return False, "Invalid address"
+            try:
+                original = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(timeout)
+                socket.gethostbyname(address)
+                return True, None
+            except socket.gaierror:
+                return False, "DNS resolution failed"
+            finally:
+                socket.setdefaulttimeout(original)
 
 
 def is_reachable(address, timeout):
@@ -95,6 +60,148 @@ def is_reachable(address, timeout):
         except OSError:
             continue
     return False
+
+
+def _parse_iso(value):
+    if not value:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def _summarize_rtsp_result(result):
+    attempts = result.get("attempts", [])
+    counts = {key: 0 for key in ("OK", "UNAUTHORIZED", "TIMEOUT", "REFUSED", "DNS_FAIL", "ERROR")}
+    for attempt in attempts:
+        status = (attempt or {}).get("status", "ERROR") or "ERROR"
+        status_upper = status.upper()
+        if status_upper in counts:
+            counts[status_upper] += 1
+        else:
+            counts["ERROR"] += 1
+    counts["TOTAL"] = len(attempts)
+    summary = {
+        "counts": counts,
+        "best_attempt": result.get("best_attempt"),
+        "status": result.get("status"),
+        "note": result.get("note"),
+    }
+    payload = {
+        "status": result.get("status"),
+        "note": result.get("note"),
+        "frames_read": result.get("frames_read"),
+        "avg_frame_size_kb": result.get("avg_frame_size_kb"),
+        "width": result.get("width"),
+        "height": result.get("height"),
+        "avg_brightness": result.get("avg_brightness"),
+        "frame_change_level": result.get("frame_change_level"),
+        "real_fps": result.get("real_fps"),
+        "attempts": attempts,
+        "best_attempt": result.get("best_attempt"),
+        "summary": summary,
+    }
+    return payload
+
+
+def _collect_device_snapshot(camera):
+    snapshot = {
+        "device": {},
+        "network": {},
+        "time": {},
+        "users": {},
+    }
+    warnings = []
+    usernames: List[str] = []
+    try:
+        devicemgmt_service = camera.create_devicemgmt_service()
+    except Exception as exc:
+        warnings.append(f"Failed to create devicemgmt service: {exc}")
+        return snapshot, usernames, warnings
+
+    device_info = safe_call(devicemgmt_service, "GetDeviceInformation")
+    if device_info.get("success"):
+        info = device_info.get("result")
+        snapshot["device"] = {
+            "manufacturer": getattr(info, "Manufacturer", None),
+            "model": getattr(info, "Model", None),
+            "firmware": getattr(info, "FirmwareVersion", None),
+            "serial": getattr(info, "SerialNumber", None),
+            "hardware_id": getattr(info, "HardwareId", None),
+        }
+    else:
+        snapshot["device_error"] = device_info.get("error")
+
+    interfaces = safe_call(devicemgmt_service, "GetNetworkInterfaces")
+    if interfaces.get("success"):
+        entries = interfaces.get("result") or []
+        if isinstance(entries, list) and entries:
+            entry = entries[0]
+            info = getattr(entry, "Info", None)
+            ipv4 = getattr(entry, "IPv4", None)
+            config = getattr(ipv4, "Config", None) if ipv4 else None
+            from_dhcp = getattr(config, "FromDHCP", None) if config else None
+            snapshot["network"] = {
+                "hw_address": getattr(info, "HwAddress", None) if info else None,
+                "ipv4": getattr(from_dhcp, "Address", None) if from_dhcp else None,
+            }
+    else:
+        snapshot["network_error"] = interfaces.get("error")
+
+    datetime_info = safe_call(devicemgmt_service, "GetSystemDateAndTime")
+    if datetime_info.get("success"):
+        camera_dt = parse_datetime(datetime_info.get("result"))
+        if camera_dt:
+            delta = abs((datetime.datetime.utcnow() - camera_dt).total_seconds())
+            snapshot["time"] = {
+                "offset_seconds": int(delta),
+                "in_sync": delta <= ALLOWED_TIME_DIFF_SECONDS,
+            }
+        else:
+            snapshot["time_error"] = "Unable to parse camera time"
+    else:
+        snapshot["time_error"] = datetime_info.get("error")
+
+    ntp_info = safe_call(devicemgmt_service, "GetNTP")
+    if ntp_info.get("success"):
+        ntp_data = ntp_info.get("result")
+        dnsname = None
+        for key in ("NTPManual", "NTPFromDHCP"):
+            entries = getattr(ntp_data, key, []) if ntp_data else []
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                for attr in ("DNSname", "IPv4Address"):
+                    value = getattr(entry, attr, None)
+                    if value:
+                        dnsname = value
+                        break
+                if dnsname:
+                    break
+            if dnsname:
+                break
+        if dnsname:
+            snapshot["network"]["ntp"] = dnsname
+    else:
+        snapshot["ntp_error"] = ntp_info.get("error")
+
+    users_call = safe_call(devicemgmt_service, "GetUsers")
+    if users_call.get("success"):
+        entries = users_call.get("result") or []
+        if isinstance(entries, list):
+            for entry in entries:
+                username = getattr(entry, "Username", None)
+                if username:
+                    usernames.append(username)
+        snapshot["users"] = {
+            "count": len(usernames),
+            "usernames": usernames,
+        }
+    else:
+        snapshot["users_error"] = users_call.get("error")
+
+    return snapshot, usernames, warnings
 
 
 def main():
@@ -126,33 +233,56 @@ def main():
     if not is_reachable(address, args.ping_timeout):
         print(json.dumps({"error": "Host unreachable"}))
         sys.exit(5)
-    username = args.username or DEFAULT_USERNAME
 
+    username = args.username or DEFAULT_USERNAME
+    baseline = load_baseline(address)
     progress = load_progress(address)
-    next_allowed = progress.get("next_allowed")
-    if next_allowed:
-        try:
-            na_dt = datetime.datetime.fromisoformat(next_allowed)
-            if datetime.datetime.utcnow() < na_dt:
-                print(
-                    json.dumps(
-                        {
-                            "error": "Camera locked, retry later",
-                            "next_allowed": next_allowed,
-                        }
-                    )
-                )
-                sys.exit(1)
-            else:
-                save_progress(
-                    address,
+    now = datetime.datetime.utcnow()
+
+    if baseline:
+        lockout_until = _parse_iso(baseline.get("lockout_until"))
+        if lockout_until and now < lockout_until:
+            payload = {
+                "status": "skipped_due_to_lockout",
+                "lockout_until": baseline.get("lockout_until"),
+            }
+            if baseline.get("lockout_message"):
+                payload["reason"] = baseline.get("lockout_message")
+            print(json.dumps(payload))
+            return
+        cooldown_until = _parse_iso(baseline.get("cooldown_until"))
+        if cooldown_until and now < cooldown_until:
+            print(
+                json.dumps(
                     {
-                        "tried_passwords": progress.get("tried_passwords", []),
-                        "next_allowed": None,
-                    },
+                        "status": "skipped_due_to_backoff",
+                        "cooldown_until": baseline.get("cooldown_until"),
+                    }
                 )
-        except Exception:
-            pass
+            )
+            return
+        if baseline.get("lockout_until") and lockout_until and now >= lockout_until:
+            baseline["lockout_until"] = None
+            baseline["lockout_message"] = None
+        if baseline.get("cooldown_until") and cooldown_until and now >= cooldown_until:
+            baseline["cooldown_until"] = None
+
+    next_allowed = _parse_iso(progress.get("next_allowed"))
+    if next_allowed and now < next_allowed:
+        print(
+            json.dumps(
+                {
+                    "status": "skipped_due_to_lockout",
+                    "next_attempt_after": progress.get("next_allowed"),
+                }
+            )
+        )
+        return
+    if progress.get("next_allowed"):
+        save_progress(
+            address,
+            {"tried_passwords": progress.get("tried_passwords", []), "next_allowed": None},
+        )
 
     missing_bins = [b for b in ("ffprobe", "ffmpeg") if shutil.which(b) is None]
     if missing_bins:
@@ -161,315 +291,181 @@ def main():
         print(json.dumps({"error": msg}))
         sys.exit(4)
 
+    notes: List[str] = []
+    port = None
+    password = args.password
+    auth_report = None
+
     try:
-        for attempt in range(MAX_MAIN_ATTEMPTS):
-            port, password, auth_report = find_working_credentials(
-                address, PORTS_TO_CHECK, username=username, password=args.password
+        for _ in range(MAX_MAIN_ATTEMPTS):
+            port, password_candidate, report_candidate = find_working_credentials(
+                address, PORTS_TO_CHECK, username=username, password=password
             )
-            if port is None:
-                progress = load_progress(address)
-                err = {"error": f"Unable to find working credentials for {address}"}
-                if progress.get("next_allowed"):
-                    err["next_allowed"] = progress["next_allowed"]
-                print(json.dumps(err))
-                sys.exit(1)
-
-            try:
-                camera = ONVIFCamera(address, port, username, password)
-                devicemgmt_service = camera.create_devicemgmt_service()
-
-                method_status = (auth_report or {}).get("method_status", {})
-                raw_results = dict((auth_report or {}).get("raw_results", {}).get("authenticated", {}))
-                unsupported_reported = set((auth_report or {}).get("unsupported_methods", []))
-                open_methods = sorted(set((auth_report or {}).get("open_methods", [])))
-                protected_methods = sorted(set((auth_report or {}).get("protected_methods", [])))
-
-                if auth_report:
-                    open_methods_log = ", ".join(open_methods) or "none"
-                    logging.debug("Open ONVIF methods: %s", open_methods_log)
-
-                def fetch_method(service_name, method_name, service_obj):
-                    key = f"{service_name}.{method_name}"
-                    status_info = method_status.get(key, {}).get("authenticated")
-                    if status_info and status_info.get("category") == "not_supported":
-                        logging.debug("Skipping unsupported method %s", key)
-                        result = {
-                            "success": False,
-                            "status": status_info.get("status"),
-                            "status_group": status_info.get("status_group"),
-                            "category": "not_supported",
-                            "error": status_info.get("error"),
-                            "result": None,
-                        }
-                        raw_results.setdefault(key, result)
-                        unsupported_reported.add(key)
-                        return result
-                    cached = raw_results.get(key)
-                    if cached:
-                        return cached
-                    result = safe_call(service_obj, method_name)
-                    raw_results[key] = result
-                    if result.get("category") == "not_supported":
-                        unsupported_reported.add(key)
-                    return result
-
-                device_info = fetch_method("devicemgmt", "GetDeviceInformation", devicemgmt_service)
-                datetime_info = fetch_method("devicemgmt", "GetSystemDateAndTime", devicemgmt_service)
-                users = fetch_method("devicemgmt", "GetUsers", devicemgmt_service)
-                interfaces = fetch_method("devicemgmt", "GetNetworkInterfaces", devicemgmt_service)
-                ntp_info = fetch_method("devicemgmt", "GetNTP", devicemgmt_service)
-                dns_info = fetch_method("devicemgmt", "GetDNS", devicemgmt_service)
-                scopes = fetch_method("devicemgmt", "GetScopes", devicemgmt_service)
-
-                unsupported_methods = sorted(unsupported_reported)
-
-                output = {
-                    "ONVIFStatus": (auth_report or {}).get("status"),
-                }
-
-                if not device_info.get("success"):
-                    if device_info.get("category") == "not_supported":
-                        logging.debug("GetDeviceInformation unsupported: %s", device_info.get("error"))
-                    else:
-                        logging.error("GetDeviceInformation error: %s", device_info.get("error"))
-                        output["DeviceInfoError"] = device_info.get("error")
-                else:
-                    info = device_info.get("result")
-                    output['Manufacturer'] = getattr(info, 'Manufacturer', None)
-                    output['Model'] = getattr(info, 'Model', None)
-                    output['FirmwareVersion'] = getattr(info, 'FirmwareVersion', None)
-                    output['SerialNumber'] = getattr(info, 'SerialNumber', None)
-                    output['HardwareId'] = getattr(info, 'HardwareId', None)
-
-                interfaces_data = interfaces.get("result") if interfaces.get("success") else []
-                if not interfaces.get("success"):
-                    if interfaces.get("category") == "not_supported":
-                        logging.debug("GetNetworkInterfaces unsupported: %s", interfaces.get("error"))
-                    else:
-                        logging.error("GetNetworkInterfaces error: %s", interfaces.get("error"))
-                        output["InterfacesError"] = interfaces.get("error")
-                        interfaces_data = []
-                if isinstance(interfaces_data, list) and interfaces_data:
-                    interface = interfaces_data[0]
-                    info = getattr(interface, 'Info', None)
-                    ipv4 = getattr(interface, 'IPv4', None)
-                    config = getattr(ipv4, 'Config', None) if ipv4 else None
-                    from_dhcp = getattr(config, 'FromDHCP', None) if config else None
-                    output['HwAddress'] = getattr(info, 'HwAddress', None) if info else None
-                    output['Address'] = getattr(from_dhcp, 'Address', None) if from_dhcp else None
-
-                output['DNSname'] = None
-
-                ntp_data = ntp_info.get("result") if ntp_info.get("success") else None
-                if not ntp_info.get("success"):
-                    if ntp_info.get("category") == "not_supported":
-                        logging.debug("GetNTP unsupported: %s", ntp_info.get("error"))
-                    else:
-                        logging.error("GetNTP error: %s", ntp_info.get("error"))
-                        output["NTPError"] = ntp_info.get("error")
-                else:
-                    for key in ('NTPManual', 'NTPFromDHCP'):
-                        entries = getattr(ntp_data, key, []) if ntp_data else []
-                        if isinstance(entries, list):
-                            for entry in entries:
-                                for attr in ('DNSname', 'IPv4Address'):
-                                    val = getattr(entry, attr, None)
-                                    if val:
-                                        output['DNSname'] = val
-                                        break
-                                if output['DNSname']:
-                                    break
-                        if output['DNSname']:
-                            break
-
-                if not dns_info.get("success"):
-                    if dns_info.get("category") == "not_supported":
-                        logging.debug("GetDNS unsupported: %s", dns_info.get("error"))
-                    else:
-                        logging.error("GetDNS error: %s", dns_info.get("error"))
-                        output["DNSError"] = dns_info.get("error")
-
-                if not scopes.get("success"):
-                    if scopes.get("category") == "not_supported":
-                        logging.debug("GetScopes unsupported: %s", scopes.get("error"))
-                    else:
-                        logging.error("GetScopes error: %s", scopes.get("error"))
-                        output["ScopesError"] = scopes.get("error")
-
-                now_utc = datetime.datetime.utcnow()
-                camera_utc = None
-                if not datetime_info.get("success"):
-                    if datetime_info.get("category") == "not_supported":
-                        logging.debug("GetSystemDateAndTime unsupported: %s", datetime_info.get("error"))
-                    else:
-                        logging.error("GetSystemDateAndTime error: %s", datetime_info.get("error"))
-                        output["DateTimeError"] = datetime_info.get("error")
-                else:
-                    camera_utc = parse_datetime(datetime_info.get("result"))
-                if camera_utc:
-                    delta = abs((now_utc - camera_utc).total_seconds())
-                    output['TimeSyncOK'] = delta <= ALLOWED_TIME_DIFF_SECONDS
-                    output['TimeDifferenceSeconds'] = int(delta)
-                else:
-                    output['TimeSyncOK'] = False
-                    output['TimeDifferenceSeconds'] = None
-
-                if not users.get("success"):
-                    if users.get("category") == "not_supported":
-                        logging.debug("GetUsers unsupported: %s", users.get("error"))
-                        output["UsersUnsupported"] = True
-                    else:
-                        logging.error("GetUsers error: %s", users.get("error"))
-                        output["UsersError"] = users.get("error")
-                    usernames = []
-                else:
-                    result_users = users.get("result") or []
-                    usernames = [user.Username for user in result_users] if isinstance(result_users, list) else []
-
-                baseline = load_baseline(address)
-
-                rtsp_port = baseline.get("rtsp_port") if baseline else None
-                rtsp_path = normalize_rtsp_path(baseline.get("rtsp_path")) if baseline else None
-                if not (rtsp_port and rtsp_path):
-                    rtsp_port, rtsp_path = get_rtsp_info(camera, address, username, password)
-                rtsp_path = normalize_rtsp_path(rtsp_path)
-
-                if users.get("success"):
-                    if baseline is None:
-                        save_baseline(address, {
-                            "users": usernames,
-                            "password": password,
-                            "port": port,
-                            "rtsp_port": rtsp_port,
-                            "rtsp_path": rtsp_path,
-                            "open_methods": open_methods,
-                            "protected_methods": protected_methods,
-                            "unsupported_methods": unsupported_methods,
-                            "method_status": method_status,
-                        })
-                        output['NewUsersDetected'] = False
-                        output['BaselineCreated'] = True
-                    else:
-                        new_users = list(set(usernames) - set(baseline.get("users", [])))
-                        output['NewUsersDetected'] = len(new_users) > 0
-                        output['NewUsernames'] = new_users
-                        output['BaselineCreated'] = False
-                        updated = False
-                        if (
-                            baseline.get("password") != password
-                            or baseline.get("port") != port
-                            or baseline.get("rtsp_port") != rtsp_port
-                            or baseline.get("rtsp_path") != rtsp_path
-                        ):
-                            baseline.update({
-                                "password": password,
-                                "port": port,
-                                "rtsp_port": rtsp_port,
-                                "rtsp_path": rtsp_path,
-                            })
-                            updated = True
-                        if baseline.get("users") != usernames:
-                            baseline["users"] = usernames
-                            updated = True
-                        if baseline.get("open_methods") != open_methods:
-                            baseline["open_methods"] = open_methods
-                            updated = True
-                        if baseline.get("protected_methods") != protected_methods:
-                            baseline["protected_methods"] = protected_methods
-                            updated = True
-                        if baseline.get("unsupported_methods") != unsupported_methods:
-                            baseline["unsupported_methods"] = unsupported_methods
-                            updated = True
-                        if baseline.get("method_status") != method_status:
-                            baseline["method_status"] = method_status
-                            updated = True
-                        if updated:
-                            save_baseline(address, baseline)
-                else:
-                    output['NewUsersDetected'] = False
-                    output['BaselineCreated'] = False
-
-                    if baseline is not None:
-                        updated = False
-                        if baseline.get("open_methods") != open_methods:
-                            baseline["open_methods"] = open_methods
-                            updated = True
-                        if baseline.get("protected_methods") != protected_methods:
-                            baseline["protected_methods"] = protected_methods
-                            updated = True
-                        if baseline.get("unsupported_methods") != unsupported_methods:
-                            baseline["unsupported_methods"] = unsupported_methods
-                            updated = True
-                        if baseline.get("method_status") != method_status:
-                            baseline["method_status"] = method_status
-                            updated = True
-                        if updated:
-                            save_baseline(address, baseline)
-
-                output['UserCount'] = len(usernames)
-
-                output['RTSPPort'] = rtsp_port
-                output['RTSPPath'] = rtsp_path
-
-                if rtsp_port and rtsp_path:
-                    u = quote(username, safe='')
-                    p = quote(password, safe='')
-                    path_enc = quote(rtsp_path, safe='/?:=&')
-                    rtsp_url = f"rtsp://{u}:{p}@{address}:{rtsp_port}{path_enc}"
-                    rtsp_info = check_rtsp_stream_with_fallback(rtsp_url)
-                    if rtsp_info["status"] == "unauthorized":
-                        remove_baseline(address)
-                        continue
-                    if rtsp_info["status"] != "ok":
-                        probe_status = fallback_ffprobe(rtsp_url)
-                        if probe_status.get("status") == "unauthorized":
-                            remove_baseline(address)
-                            continue
-                        if probe_status.get("status") == "ok":
-                            rtsp_info["status"] = "ok"
-                            rtsp_info["note"] += " | Metadata via ffprobe"
-                            if not rtsp_info.get("width") and probe_status.get("width"):
-                                rtsp_info["width"] = probe_status.get("width")
-                                rtsp_info["height"] = probe_status.get("height")
-                    output.update(rtsp_info)
-                else:
-                    output.update({
-                        "status": "no_rtsp",
-                        "frames_read": 0,
-                        "avg_frame_size_kb": 0,
-                        "width": None,
-                        "height": None,
-                        "avg_brightness": 0,
-                        "frame_change_level": 0,
-                        "real_fps": 0,
-                        "note": "No RTSP URI found",
-                    })
-
-                print(json.dumps(output, indent=4, ensure_ascii=False, default=str))
+            if port is not None:
+                password = password_candidate
+                auth_report = report_candidate
                 break
+        if port is None:
+            err = {
+                "status": "credentials_not_found",
+                "error": f"Unable to find working credentials for {address}",
+            }
+            progress = load_progress(address)
+            if progress.get("next_allowed"):
+                err["next_attempt_after"] = progress["next_allowed"]
+            print(json.dumps(err))
+            return
 
-            except Fault as fault:
-                logging.error("ONVIF Fault: %s", fault, exc_info=True)
-                print(json.dumps({"error": f"ONVIF Fault: {fault}"}))
-                sys.exit(6)
-            except ONVIFError as err:
-                logging.error("ONVIF Error: %s", err, exc_info=True)
-                print(json.dumps({"error": f"ONVIF Error: {err}"}))
-                sys.exit(6)
-            except socket.error as err:
-                logging.error("Socket Error: %s", err, exc_info=True)
-                print(json.dumps({"error": f"Socket Error: {err}"}))
-                sys.exit(5)
-            except Exception as e:
-                logging.critical("Unexpected Error: %s", e, exc_info=True)
-                print(json.dumps({"error": f"Unexpected Error: {e}"}))
-                sys.exit(7)
+        if auth_report is None:
+            auth_report = try_onvif_connection(address, port, username, password)
 
-        # continue loop on exception
+        final_verdict = auth_report.get("final_verdict")
 
+        try:
+            camera = ONVIFCamera(address, port, username, password)
+        except Exception as exc:
+            print(json.dumps({"status": "onvif_error", "error": str(exc)}))
+            return
+
+        device_snapshot, usernames, warnings = _collect_device_snapshot(camera)
+        notes.extend(warnings)
+
+        rtsp_port, rtsp_path = get_rtsp_info(camera, address, username, password)
+        if rtsp_port is None and baseline:
+            rtsp_port = baseline.get("rtsp_port")
+        if rtsp_path is None and baseline:
+            rtsp_path = baseline.get("rtsp_path")
+
+        rtsp_result = {
+            "status": "not_available",
+            "note": "No RTSP URI provided",
+            "frames_read": 0,
+            "avg_frame_size_kb": 0.0,
+            "width": None,
+            "height": None,
+            "avg_brightness": 0.0,
+            "frame_change_level": 0.0,
+            "real_fps": 0.0,
+            "attempts": [],
+        }
+        best_url = None
+        if rtsp_port and rtsp_path:
+            encoded_path = quote(rtsp_path, safe="/?:=&")
+            rtsp_url = f"rtsp://{quote(username, safe='')}:{quote(password, safe='')}@{address}:{rtsp_port}{encoded_path}"
+            rtsp_result = check_rtsp_stream_with_fallback(rtsp_url)
+            best_url = (rtsp_result.get("best_attempt") or {}).get("url")
+        rtsp_phase = _summarize_rtsp_result(rtsp_result)
+
+        best_attempt = rtsp_phase.get("best_attempt") or {}
+        best_path = best_attempt.get("path")
+
+        baseline_users = (baseline or {}).get("users", [])
+        user_changes = {}
+        if baseline_users:
+            new_users = sorted(set(usernames) - set(baseline_users))
+            removed_users = sorted(set(baseline_users) - set(usernames))
+            if new_users:
+                user_changes["new"] = new_users
+            if removed_users:
+                user_changes["removed"] = removed_users
         else:
-            print(json.dumps({"error": "Maximum attempts exceeded"}))
-            sys.exit(1)
+            user_changes["new"] = usernames
+        if user_changes.get("new"):
+            notes.append("New users detected: " + ", ".join(user_changes["new"]))
+        if user_changes.get("removed"):
+            notes.append("Users removed: " + ", ".join(user_changes["removed"]))
+        device_snapshot.setdefault("users", {})["changes"] = user_changes
+
+        lock_seconds = auth_report.get("lock_seconds")
+        next_attempt_after = None
+        if final_verdict == "LOCKED" and lock_seconds:
+            next_attempt_after = (datetime.datetime.utcnow() + datetime.timedelta(seconds=lock_seconds)).isoformat()
+
+        baseline_data = baseline or {
+            "users": [],
+            "password": "",
+            "port": None,
+            "rtsp_port": None,
+            "rtsp_path": None,
+            "open_methods": [],
+            "protected_methods": [],
+            "unsupported_methods": [],
+            "method_status": {},
+            "last_auth_status": None,
+            "lockout_until": None,
+            "lockout_message": None,
+            "last_endpoints": {},
+            "last_good_stream_uri": None,
+            "rtsp_best_path": None,
+            "cooldown_until": None,
+            "rtsp_attempts": [],
+        }
+        baseline_data["users"] = usernames
+        baseline_data["password"] = password
+        baseline_data["port"] = port
+        baseline_data["rtsp_port"] = rtsp_port
+        baseline_data["rtsp_path"] = rtsp_path
+        baseline_data["last_auth_status"] = final_verdict
+        baseline_data["last_endpoints"] = auth_report.get("services", {})
+        baseline_data["last_good_stream_uri"] = best_url
+        baseline_data["rtsp_best_path"] = best_path
+        baseline_data["rtsp_attempts"] = rtsp_phase.get("attempts", [])
+        baseline_data["cooldown_until"] = None
+
+        if final_verdict == "LOCKED" and lock_seconds:
+            lock_until_dt = datetime.datetime.utcnow() + datetime.timedelta(seconds=lock_seconds)
+            baseline_data["lockout_until"] = lock_until_dt.isoformat()
+            baseline_data["lockout_message"] = "Camera reported lockout"
+            if next_attempt_after is None:
+                next_attempt_after = baseline_data["lockout_until"]
+        else:
+            baseline_data["lockout_until"] = None
+            baseline_data["lockout_message"] = None
+
+        save_baseline(address, baseline_data)
+
+        anonymous_phase = auth_report.get("phase", {}).get("anonymous", {})
+        auth_phase = auth_report.get("phase", {}).get("authenticated", {})
+        payload = {
+            "final_verdict": final_verdict,
+            "phase": {
+                "anonymous_audit": anonymous_phase,
+                "auth_check": auth_phase,
+                "rtsp_fallback": rtsp_phase,
+            },
+            "services": auth_report.get("services", {}),
+            "critical": auth_report.get("critical", {}),
+            "anonymous_exposure": {
+                "verdict": anonymous_phase.get("summary", {}).get("verdict"),
+                "open_methods": auth_report.get("anonymous_exposure", []),
+            },
+            "media_denied": auth_report.get("media_denied"),
+            "camera": device_snapshot,
+            "rtsp_best_path": best_path,
+            "notes": notes,
+            "next_attempt_after": next_attempt_after,
+        }
+        if best_url:
+            payload["rtsp_best_uri"] = best_url
+
+        print(json.dumps(payload, ensure_ascii=False, default=str))
+
+    except Fault as fault:
+        logging.error("ONVIF Fault: %s", fault, exc_info=True)
+        print(json.dumps({"error": f"ONVIF Fault: {fault}"}))
+        sys.exit(6)
+    except ONVIFError as err:
+        logging.error("ONVIF Error: %s", err, exc_info=True)
+        print(json.dumps({"error": f"ONVIF Error: {err}"}))
+        sys.exit(6)
+    except socket.error as err:
+        logging.error("Socket Error: %s", err, exc_info=True)
+        print(json.dumps({"error": f"Socket Error: {err}"}))
+        sys.exit(5)
+    except Exception as exc:
+        logging.critical("Unexpected Error: %s", exc, exc_info=True)
+        print(json.dumps({"error": f"Unexpected Error: {exc}"}))
+        sys.exit(7)
     finally:
         remove_progress(address)
 
