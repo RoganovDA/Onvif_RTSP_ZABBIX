@@ -162,10 +162,37 @@ def check_rtsp_stream(url, timeout=5, duration=5.0):
     return result
 
 
+def _run_ffprobe(cmd, timeout):
+    cmd_log = cmd[:-1] + [mask_credentials(cmd[-1])]
+    logging.debug("Running ffprobe command: %s", " ".join(cmd_log))
+    with suppress_stderr():
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def _parse_ffprobe_output(process):
+    err_out = (process.stderr or "") + (process.stdout or "")
+    logging.debug("ffprobe stderr: %s", err_out.strip())
+    err_lower = err_out.lower()
+    if "401" in err_lower or "unauthorized" in err_lower or "not authorized" in err_lower:
+        return {"status": "unauthorized"}
+    try:
+        info = json.loads(process.stdout or "{}")
+    except json.JSONDecodeError:
+        info = {}
+    if info.get("streams"):
+        stream = info["streams"][0]
+        return {
+            "status": "ok",
+            "width": stream.get("width"),
+            "height": stream.get("height"),
+        }
+    return {"status": "error", "stderr": err_out}
+
+
 def fallback_ffprobe(url, timeout=5, transport="tcp"):
     timeout_us = str(int(timeout * 1e6))
-    logging.info("ffprobe stimeout=%s", timeout_us)
-    cmd = [
+    logging.info("ffprobe timeout=%s", timeout_us)
+    base_cmd = [
         "ffprobe", "-v", "error",
         "-rtsp_transport", transport,
         "-stimeout", timeout_us,
@@ -174,24 +201,32 @@ def fallback_ffprobe(url, timeout=5, transport="tcp"):
         "-show_entries", "stream=width,height,codec_name",
         "-of", "json",
     ]
-    cmd_log = cmd[:-1] + [mask_credentials(cmd[-1])]
-    logging.debug("Running ffprobe command: %s", " ".join(cmd_log))
     try:
-        with suppress_stderr():
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
-        err_out = (p.stderr or "") + (p.stdout or "")
-        logging.debug("ffprobe stderr: %s", err_out.strip())
-        err_lower = err_out.lower()
-        if "401" in err_lower or "unauthorized" in err_lower or "not authorized" in err_lower:
-            return {"status": "unauthorized"}
-        info = json.loads(p.stdout or "{}")
-        if info.get("streams"):
-            stream = info["streams"][0]
-            return {
-                "status": "ok",
-                "width": stream.get("width"),
-                "height": stream.get("height"),
-            }
+        proc = _run_ffprobe(base_cmd, timeout + 2)
+        result = _parse_ffprobe_output(proc)
+        stderr = result.get("stderr", "")
+        if result.get("status") != "error" or not stderr:
+            result.pop("stderr", None)
+            return result
+        if "stimeout" not in stderr.lower():
+            result.pop("stderr", None)
+            return result
+        logging.info("ffprobe does not support -stimeout, retrying with -rw_timeout")
+        alt_cmd = [
+            "ffprobe", "-v", "error",
+            "-rtsp_transport", transport,
+            "-rw_timeout", timeout_us,
+            "-i", url,
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,codec_name",
+            "-of", "json",
+        ]
+        proc = _run_ffprobe(alt_cmd, timeout + 2)
+        result = _parse_ffprobe_output(proc)
+        result.pop("stderr", None)
+        return result
+    except subprocess.TimeoutExpired:
+        logging.error("ffprobe timed out for %s", mask_credentials(url))
     except Exception as e:
         logging.error("ffprobe error: %s", e, exc_info=True)
     return {"status": "error"}

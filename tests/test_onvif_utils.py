@@ -1,3 +1,4 @@
+import pathlib
 import sys
 import types
 import unittest
@@ -44,6 +45,8 @@ def _install_cv2_stub():
 
 
 _install_cv2_stub()
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import onvif_utils
 

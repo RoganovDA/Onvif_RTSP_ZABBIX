@@ -25,7 +25,6 @@ from param import (
     PASSWORDS,
     RTSP_PATH_CANDIDATES,
 )
-from rtsp_utils import fallback_ffprobe
 
 
 STATUS_RE = re.compile(r"(?:HTTP\s*)?(?P<code>[1-5]\d{2})")
@@ -39,6 +38,9 @@ LOCK_KEYWORDS = (
     "too many attempts",
     "too many failures",
 )
+
+DEVICE_PREFIX = "devicemgmt."
+MEDIA_PREFIX = "media."
 
 
 def _method_key(service: str, method: str) -> str:
@@ -465,6 +467,34 @@ def try_onvif_connection(
         if report.get("first_success") is None and auth_entry and auth_entry.get("success"):
             report["first_success"] = mkey
 
+    def _entries_with_prefix(prefix: str) -> List[Dict[str, Any]]:
+        return [
+            authenticated_results[k]
+            for k in authenticated_results
+            if k.startswith(prefix) and authenticated_results[k] is not None
+        ]
+
+    device_entries = _entries_with_prefix(DEVICE_PREFIX)
+    media_entries = _entries_with_prefix(MEDIA_PREFIX)
+
+    device_success = any(entry.get("success") for entry in device_entries)
+    media_success = any(entry.get("success") for entry in media_entries)
+    media_unauthorized = any(
+        entry.get("category") == "unauthorized" for entry in media_entries
+    )
+    media_not_supported = all(
+        entry.get("category") == "not_supported" for entry in media_entries
+    ) if media_entries else False
+
+    media_available = None
+    cap_entry = authenticated_results.get(f"{DEVICE_PREFIX}GetCapabilities")
+    if cap_entry and cap_entry.get("success"):
+        cap_result = cap_entry.get("result")
+        capabilities = getattr(cap_result, "Capabilities", cap_result)
+        media_cap = getattr(capabilities, "Media", None)
+        media_available = bool(media_cap)
+    report["media_available"] = media_available
+
     if report["status"] == "locked":
         return report
 
@@ -485,6 +515,14 @@ def try_onvif_connection(
             # Preserve earlier status if set, otherwise generic error
             if report["status"] not in ("locked", "unauthorized"):
                 report["status"] = report["status"] if report["status"] != "error" else "error"
+
+    if report.get("status") in ("success", "unauthorized"):
+        if media_available is False and device_success:
+            report["status"] = "limited_onvif"
+        elif device_success and not media_success and media_unauthorized:
+            report["status"] = "insufficient_role"
+        elif media_not_supported and device_success and not media_success:
+            report["status"] = "limited_onvif"
 
     if report["status"] == "unauthorized":
         logging.debug(
@@ -519,9 +557,9 @@ def find_onvif_port(
             with socket.create_connection((ip, port), timeout=timeout):
                 report = try_onvif_connection(ip, port, username, password)
                 status = report.get("status")
-                if status == "success":
+                if status in ("success", "insufficient_role", "limited_onvif"):
                     report["port"] = port
-                    return {"status": "success", "port": port, "report": report}
+                    return {"status": status, "port": port, "report": report}
                 if status == "locked":
                     return {
                         "status": "locked",
@@ -568,7 +606,7 @@ def find_working_credentials(
 
     def evaluate_report(port, pw, report):
         status = report.get("status")
-        if status == "success":
+        if status in ("success", "insufficient_role", "limited_onvif"):
             return port, pw, report
         if status == "locked":
             return record_lock(report.get("lock_seconds", 31 * 60))
@@ -605,7 +643,7 @@ def find_working_credentials(
                 return record_lock(port_info.get("lock_seconds", 31 * 60))
             if status == "unauthorized":
                 return None, None, None
-            if status == "success":
+            if status in ("success", "insufficient_role", "limited_onvif"):
                 return port_info["port"], password, port_info.get("report")
         return None, None, None
 
@@ -639,7 +677,7 @@ def find_working_credentials(
             if status == "unauthorized":
                 remove_baseline(ip)
                 baseline_password = None
-            if status == "success":
+            if status in ("success", "insufficient_role", "limited_onvif"):
                 return port_info["port"], baseline_password, port_info.get("report")
         remove_baseline(ip)
 
@@ -671,6 +709,8 @@ def normalize_rtsp_path(path: Optional[str]) -> Optional[str]:
 
 
 def get_rtsp_info(camera, ip, username, password):
+    from rtsp_utils import fallback_ffprobe
+
     try:
         media_service = camera.create_media_service()
         profiles = media_service.GetProfiles()

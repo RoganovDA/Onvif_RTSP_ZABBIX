@@ -225,7 +225,17 @@ def main():
 
                 output = {
                     "ONVIFStatus": (auth_report or {}).get("status"),
+                    "MediaAvailable": (auth_report or {}).get("media_available"),
+                    "OpenMethods": open_methods,
+                    "ProtectedMethods": protected_methods,
+                    "UnsupportedMethods": unsupported_methods,
                 }
+
+                auth_status = output["ONVIFStatus"]
+                if auth_status == "insufficient_role":
+                    output["AuthNote"] = "Authenticated but media access denied"
+                elif auth_status == "limited_onvif":
+                    output["AuthNote"] = "Media service not advertised by camera"
 
                 if not device_info.get("success"):
                     if device_info.get("category") == "not_supported":
@@ -418,13 +428,22 @@ def main():
                     rtsp_url = f"rtsp://{u}:{p}@{address}:{rtsp_port}{path_enc}"
                     rtsp_info = check_rtsp_stream_with_fallback(rtsp_url)
                     if rtsp_info["status"] == "unauthorized":
-                        remove_baseline(address)
-                        continue
+                        output.update(rtsp_info)
+                        output.setdefault(
+                            "note",
+                            "RTSP stream requires different credentials or permissions",
+                        )
+                        output["status"] = "unauthorized"
+                        print(json.dumps(output, indent=4, ensure_ascii=False, default=str))
+                        break
                     if rtsp_info["status"] != "ok":
                         probe_status = fallback_ffprobe(rtsp_url)
                         if probe_status.get("status") == "unauthorized":
-                            remove_baseline(address)
-                            continue
+                            output.update(rtsp_info)
+                            output["status"] = "unauthorized"
+                            output["note"] = "RTSP probe unauthorized"
+                            print(json.dumps(output, indent=4, ensure_ascii=False, default=str))
+                            break
                         if probe_status.get("status") == "ok":
                             rtsp_info["status"] = "ok"
                             rtsp_info["note"] += " | Metadata via ffprobe"
