@@ -82,13 +82,42 @@ def _parse_iso(value):
 def _summarize_rtsp_result(result):
     attempts = result.get("attempts", [])
     counts = {key: 0 for key in ("OK", "UNAUTHORIZED", "TIMEOUT", "REFUSED", "DNS_FAIL", "ERROR")}
+
+    def _normalize_attempt_status(value):
+        if not value:
+            return None
+        normalized = str(value).strip().upper().replace("-", "_")
+        aliases = {
+            "AUTH_REQUIRED": "UNAUTHORIZED",
+            "UNAUTHORISED": "UNAUTHORIZED",
+            "401": "UNAUTHORIZED",
+            "403": "UNAUTHORIZED",
+            "CONNECTION_REFUSED": "REFUSED",
+            "REFUSE": "REFUSED",
+            "CONN_REFUSED": "REFUSED",
+            "TIMED_OUT": "TIMEOUT",
+            "TIMEOUT": "TIMEOUT",
+            "ERR_TIMEOUT": "TIMEOUT",
+            "DNS_FAILURE": "DNS_FAIL",
+            "DNS_ERROR": "DNS_FAIL",
+            "DNS": "DNS_FAIL",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized in counts:
+            return normalized
+        for key in counts:
+            if normalized.endswith(key):
+                return key
+        return None
+
     for attempt in attempts:
-        status = (attempt or {}).get("status", "ERROR") or "ERROR"
-        status_upper = status.upper()
-        if status_upper in counts:
-            counts[status_upper] += 1
-        else:
-            counts["ERROR"] += 1
+        attempt_dict = attempt or {}
+        status = _normalize_attempt_status(attempt_dict.get("status"))
+        if not status:
+            status = _normalize_attempt_status(attempt_dict.get("probe_status"))
+        if not status:
+            status = "ERROR"
+        counts[status] += 1
     counts["TOTAL"] = len(attempts)
     summary = {
         "counts": counts,
