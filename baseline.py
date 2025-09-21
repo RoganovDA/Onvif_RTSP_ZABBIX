@@ -125,6 +125,10 @@ def load_baseline(ip):
             "port": None,
             "rtsp_port": None,
             "rtsp_path": None,
+            "open_methods": [],
+            "protected_methods": [],
+            "unsupported_methods": [],
+            "method_status": {},
         }
         save_baseline(ip, upgraded)
         logging.info("Upgraded old baseline format for %s", ip)
@@ -133,6 +137,10 @@ def load_baseline(ip):
     if not required_keys.issubset(data.keys()):
         remove_baseline(ip)
         return None
+    data.setdefault("open_methods", [])
+    data.setdefault("protected_methods", [])
+    data.setdefault("unsupported_methods", [])
+    data.setdefault("method_status", {})
     return data
 
 

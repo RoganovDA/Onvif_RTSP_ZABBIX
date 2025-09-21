@@ -163,7 +163,7 @@ def main():
 
     try:
         for attempt in range(MAX_MAIN_ATTEMPTS):
-            port, password = find_working_credentials(
+            port, password, auth_report = find_working_credentials(
                 address, PORTS_TO_CHECK, username=username, password=args.password
             )
             if port is None:
@@ -178,32 +178,79 @@ def main():
                 camera = ONVIFCamera(address, port, username, password)
                 devicemgmt_service = camera.create_devicemgmt_service()
 
-                device_info = safe_call(devicemgmt_service, "GetDeviceInformation")
-                datetime_info = safe_call(devicemgmt_service, "GetSystemDateAndTime")
-                users = safe_call(devicemgmt_service, "GetUsers")
-                interfaces = safe_call(devicemgmt_service, "GetNetworkInterfaces")
-                ntp_info = safe_call(devicemgmt_service, "GetNTP")
-                dns_info = safe_call(devicemgmt_service, "GetDNS")
-                scopes = safe_call(devicemgmt_service, "GetScopes")
+                method_status = (auth_report or {}).get("method_status", {})
+                raw_results = dict((auth_report or {}).get("raw_results", {}).get("authenticated", {}))
+                unsupported_reported = set((auth_report or {}).get("unsupported_methods", []))
+                open_methods = sorted(set((auth_report or {}).get("open_methods", [])))
+                protected_methods = sorted(set((auth_report or {}).get("protected_methods", [])))
 
-                output = {}
+                if auth_report:
+                    open_methods_log = ", ".join(open_methods) or "none"
+                    logging.debug("Open ONVIF methods: %s", open_methods_log)
 
-                if isinstance(device_info, dict) and "error" in device_info:
-                    logging.error("GetDeviceInformation error: %s", device_info["error"])
-                    output["DeviceInfoError"] = device_info["error"]
-                elif device_info:
-                    output['Manufacturer'] = getattr(device_info, 'Manufacturer', None)
-                    output['Model'] = getattr(device_info, 'Model', None)
-                    output['FirmwareVersion'] = getattr(device_info, 'FirmwareVersion', None)
-                    output['SerialNumber'] = getattr(device_info, 'SerialNumber', None)
-                    output['HardwareId'] = getattr(device_info, 'HardwareId', None)
+                def fetch_method(service_name, method_name, service_obj):
+                    key = f"{service_name}.{method_name}"
+                    status_info = method_status.get(key, {}).get("authenticated")
+                    if status_info and status_info.get("category") == "not_supported":
+                        logging.debug("Skipping unsupported method %s", key)
+                        result = {
+                            "success": False,
+                            "status": status_info.get("status"),
+                            "status_group": status_info.get("status_group"),
+                            "category": "not_supported",
+                            "error": status_info.get("error"),
+                            "result": None,
+                        }
+                        raw_results.setdefault(key, result)
+                        unsupported_reported.add(key)
+                        return result
+                    cached = raw_results.get(key)
+                    if cached:
+                        return cached
+                    result = safe_call(service_obj, method_name)
+                    raw_results[key] = result
+                    if result.get("category") == "not_supported":
+                        unsupported_reported.add(key)
+                    return result
 
-                if isinstance(interfaces, dict) and "error" in interfaces:
-                    logging.error("GetNetworkInterfaces error: %s", interfaces["error"])
-                    output["InterfacesError"] = interfaces["error"]
-                    interfaces = []
-                if isinstance(interfaces, list) and interfaces:
-                    interface = interfaces[0]
+                device_info = fetch_method("devicemgmt", "GetDeviceInformation", devicemgmt_service)
+                datetime_info = fetch_method("devicemgmt", "GetSystemDateAndTime", devicemgmt_service)
+                users = fetch_method("devicemgmt", "GetUsers", devicemgmt_service)
+                interfaces = fetch_method("devicemgmt", "GetNetworkInterfaces", devicemgmt_service)
+                ntp_info = fetch_method("devicemgmt", "GetNTP", devicemgmt_service)
+                dns_info = fetch_method("devicemgmt", "GetDNS", devicemgmt_service)
+                scopes = fetch_method("devicemgmt", "GetScopes", devicemgmt_service)
+
+                unsupported_methods = sorted(unsupported_reported)
+
+                output = {
+                    "ONVIFStatus": (auth_report or {}).get("status"),
+                }
+
+                if not device_info.get("success"):
+                    if device_info.get("category") == "not_supported":
+                        logging.debug("GetDeviceInformation unsupported: %s", device_info.get("error"))
+                    else:
+                        logging.error("GetDeviceInformation error: %s", device_info.get("error"))
+                        output["DeviceInfoError"] = device_info.get("error")
+                else:
+                    info = device_info.get("result")
+                    output['Manufacturer'] = getattr(info, 'Manufacturer', None)
+                    output['Model'] = getattr(info, 'Model', None)
+                    output['FirmwareVersion'] = getattr(info, 'FirmwareVersion', None)
+                    output['SerialNumber'] = getattr(info, 'SerialNumber', None)
+                    output['HardwareId'] = getattr(info, 'HardwareId', None)
+
+                interfaces_data = interfaces.get("result") if interfaces.get("success") else []
+                if not interfaces.get("success"):
+                    if interfaces.get("category") == "not_supported":
+                        logging.debug("GetNetworkInterfaces unsupported: %s", interfaces.get("error"))
+                    else:
+                        logging.error("GetNetworkInterfaces error: %s", interfaces.get("error"))
+                        output["InterfacesError"] = interfaces.get("error")
+                        interfaces_data = []
+                if isinstance(interfaces_data, list) and interfaces_data:
+                    interface = interfaces_data[0]
                     info = getattr(interface, 'Info', None)
                     ipv4 = getattr(interface, 'IPv4', None)
                     config = getattr(ipv4, 'Config', None) if ipv4 else None
@@ -213,12 +260,16 @@ def main():
 
                 output['DNSname'] = None
 
-                if isinstance(ntp_info, dict) and "error" in ntp_info:
-                    logging.error("GetNTP error: %s", ntp_info["error"])
-                    output["NTPError"] = ntp_info["error"]
+                ntp_data = ntp_info.get("result") if ntp_info.get("success") else None
+                if not ntp_info.get("success"):
+                    if ntp_info.get("category") == "not_supported":
+                        logging.debug("GetNTP unsupported: %s", ntp_info.get("error"))
+                    else:
+                        logging.error("GetNTP error: %s", ntp_info.get("error"))
+                        output["NTPError"] = ntp_info.get("error")
                 else:
                     for key in ('NTPManual', 'NTPFromDHCP'):
-                        entries = getattr(ntp_info, key, []) if ntp_info else []
+                        entries = getattr(ntp_data, key, []) if ntp_data else []
                         if isinstance(entries, list):
                             for entry in entries:
                                 for attr in ('DNSname', 'IPv4Address'):
@@ -231,21 +282,30 @@ def main():
                         if output['DNSname']:
                             break
 
-                if isinstance(dns_info, dict) and "error" in dns_info:
-                    logging.error("GetDNS error: %s", dns_info["error"])
-                    output["DNSError"] = dns_info["error"]
+                if not dns_info.get("success"):
+                    if dns_info.get("category") == "not_supported":
+                        logging.debug("GetDNS unsupported: %s", dns_info.get("error"))
+                    else:
+                        logging.error("GetDNS error: %s", dns_info.get("error"))
+                        output["DNSError"] = dns_info.get("error")
 
-                if isinstance(scopes, dict) and "error" in scopes:
-                    logging.error("GetScopes error: %s", scopes["error"])
-                    output["ScopesError"] = scopes["error"]
+                if not scopes.get("success"):
+                    if scopes.get("category") == "not_supported":
+                        logging.debug("GetScopes unsupported: %s", scopes.get("error"))
+                    else:
+                        logging.error("GetScopes error: %s", scopes.get("error"))
+                        output["ScopesError"] = scopes.get("error")
 
                 now_utc = datetime.datetime.utcnow()
                 camera_utc = None
-                if isinstance(datetime_info, dict) and "error" in datetime_info:
-                    logging.error("GetSystemDateAndTime error: %s", datetime_info["error"])
-                    output["DateTimeError"] = datetime_info["error"]
+                if not datetime_info.get("success"):
+                    if datetime_info.get("category") == "not_supported":
+                        logging.debug("GetSystemDateAndTime unsupported: %s", datetime_info.get("error"))
+                    else:
+                        logging.error("GetSystemDateAndTime error: %s", datetime_info.get("error"))
+                        output["DateTimeError"] = datetime_info.get("error")
                 else:
-                    camera_utc = parse_datetime(datetime_info)
+                    camera_utc = parse_datetime(datetime_info.get("result"))
                 if camera_utc:
                     delta = abs((now_utc - camera_utc).total_seconds())
                     output['TimeSyncOK'] = delta <= ALLOWED_TIME_DIFF_SECONDS
@@ -254,12 +314,17 @@ def main():
                     output['TimeSyncOK'] = False
                     output['TimeDifferenceSeconds'] = None
 
-                if isinstance(users, dict) and "error" in users:
-                    logging.error("GetUsers error: %s", users["error"])
-                    output["UsersError"] = users["error"]
+                if not users.get("success"):
+                    if users.get("category") == "not_supported":
+                        logging.debug("GetUsers unsupported: %s", users.get("error"))
+                        output["UsersUnsupported"] = True
+                    else:
+                        logging.error("GetUsers error: %s", users.get("error"))
+                        output["UsersError"] = users.get("error")
                     usernames = []
                 else:
-                    usernames = [user.Username for user in users] if isinstance(users, list) else []
+                    result_users = users.get("result") or []
+                    usernames = [user.Username for user in result_users] if isinstance(result_users, list) else []
 
                 baseline = load_baseline(address)
 
@@ -269,7 +334,7 @@ def main():
                     rtsp_port, rtsp_path = get_rtsp_info(camera, address, username, password)
                 rtsp_path = normalize_rtsp_path(rtsp_path)
 
-                if "UsersError" not in output:
+                if users.get("success"):
                     if baseline is None:
                         save_baseline(address, {
                             "users": usernames,
@@ -277,6 +342,10 @@ def main():
                             "port": port,
                             "rtsp_port": rtsp_port,
                             "rtsp_path": rtsp_path,
+                            "open_methods": open_methods,
+                            "protected_methods": protected_methods,
+                            "unsupported_methods": unsupported_methods,
+                            "method_status": method_status,
                         })
                         output['NewUsersDetected'] = False
                         output['BaselineCreated'] = True
@@ -302,11 +371,40 @@ def main():
                         if baseline.get("users") != usernames:
                             baseline["users"] = usernames
                             updated = True
+                        if baseline.get("open_methods") != open_methods:
+                            baseline["open_methods"] = open_methods
+                            updated = True
+                        if baseline.get("protected_methods") != protected_methods:
+                            baseline["protected_methods"] = protected_methods
+                            updated = True
+                        if baseline.get("unsupported_methods") != unsupported_methods:
+                            baseline["unsupported_methods"] = unsupported_methods
+                            updated = True
+                        if baseline.get("method_status") != method_status:
+                            baseline["method_status"] = method_status
+                            updated = True
                         if updated:
                             save_baseline(address, baseline)
                 else:
                     output['NewUsersDetected'] = False
                     output['BaselineCreated'] = False
+
+                    if baseline is not None:
+                        updated = False
+                        if baseline.get("open_methods") != open_methods:
+                            baseline["open_methods"] = open_methods
+                            updated = True
+                        if baseline.get("protected_methods") != protected_methods:
+                            baseline["protected_methods"] = protected_methods
+                            updated = True
+                        if baseline.get("unsupported_methods") != unsupported_methods:
+                            baseline["unsupported_methods"] = unsupported_methods
+                            updated = True
+                        if baseline.get("method_status") != method_status:
+                            baseline["method_status"] = method_status
+                            updated = True
+                        if updated:
+                            save_baseline(address, baseline)
 
                 output['UserCount'] = len(usernames)
 
