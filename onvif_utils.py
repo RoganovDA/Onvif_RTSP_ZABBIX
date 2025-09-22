@@ -225,9 +225,25 @@ def safe_call(
     *,
     allow_redirect: bool = True,
 ) -> Dict[str, Any]:
-    method = getattr(service, method_name)
-    prepared = _build_params(params, service)
     start = time.perf_counter()
+    try:
+        method = getattr(service, method_name)
+    except AttributeError as err:
+        latency = round((time.perf_counter() - start) * 1000, 2)
+        missing = _build_error_result(err, latency_ms=latency)
+        missing.update(
+            {
+                "status": None,
+                "status_group": None,
+                "category": "not_supported",
+                "error": (
+                    f"Method {service.__class__.__name__}.{method_name} unavailable"
+                ),
+            }
+        )
+        return missing
+
+    prepared = _build_params(params, service)
     try:
         if prepared is None:
             response = method()
