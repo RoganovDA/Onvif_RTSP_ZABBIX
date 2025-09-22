@@ -6,7 +6,7 @@ import re
 import shutil
 import socket
 import sys
-from typing import List
+from typing import Any, List
 from urllib.parse import quote
 
 from onvif import ONVIFCamera
@@ -35,6 +35,17 @@ from rtsp_utils import check_rtsp_stream_with_fallback
 
 
 HOSTNAME_RE = re.compile(r"^[A-Za-z0-9.-]+$")
+
+
+def emit_json(data: Any, *, default=None) -> None:
+    print(
+        json.dumps(
+            data,
+            indent=2,
+            ensure_ascii=False,
+            default=default or str,
+        )
+    )
 
 
 def validate_address(address, timeout=5):
@@ -259,13 +270,13 @@ def _run_rtsp_candidate_fallback(address, username, password, port_candidates, p
             result_attempts = result.get("attempts", [])
             for attempt in result_attempts:
                 attempt_copy = dict(attempt or {})
-                attempt_copy.setdefault("path", normalized_path)
+                attempt_copy["path"] = normalized_path
                 attempt_copy["port"] = port
                 attempts.append(attempt_copy)
             candidate_best = result.get("best_attempt")
             if candidate_best:
                 candidate_best = dict(candidate_best)
-                candidate_best.setdefault("path", normalized_path)
+                candidate_best["path"] = normalized_path
                 candidate_best["port"] = port
             standardized = _standardize_rtsp_result(result)
             if candidate_best:
@@ -422,13 +433,13 @@ def main():
     logging.basicConfig(**log_kwargs)
 
     if not args.address:
-        print(json.dumps({"error": "Usage: camcheck.py <ADDRESS>"}))
+        emit_json({"error": "Usage: camcheck.py <ADDRESS>"})
         sys.exit(1)
 
     address = args.address
     valid, err_msg = validate_address(address, args.ping_timeout)
     if not valid:
-        print(json.dumps({"error": err_msg or "Invalid address"}))
+        emit_json({"error": err_msg or "Invalid address"})
         sys.exit(1)
 
     baseline = load_baseline(address)
@@ -441,7 +452,7 @@ def main():
     reachability_hints.append(DEFAULT_RTSP_PORT)
     reachability_ports = _unique_preserve(reachability_hints)
     if not is_reachable(address, args.ping_timeout, ports=reachability_ports):
-        print(json.dumps({"error": "Host unreachable"}))
+        emit_json({"error": "Host unreachable"})
         sys.exit(5)
 
     username = args.username or DEFAULT_USERNAME
@@ -457,17 +468,15 @@ def main():
             }
             if baseline.get("lockout_message"):
                 payload["reason"] = baseline.get("lockout_message")
-            print(json.dumps(payload))
+            emit_json(payload)
             return
         cooldown_until = _parse_iso(baseline.get("cooldown_until"))
         if cooldown_until and now < cooldown_until:
-            print(
-                json.dumps(
-                    {
-                        "status": "skipped_due_to_backoff",
-                        "cooldown_until": baseline.get("cooldown_until"),
-                    }
-                )
+            emit_json(
+                {
+                    "status": "skipped_due_to_backoff",
+                    "cooldown_until": baseline.get("cooldown_until"),
+                }
             )
             return
         if baseline.get("lockout_until") and lockout_until and now >= lockout_until:
@@ -478,13 +487,11 @@ def main():
 
     next_allowed = _parse_iso(progress.get("next_allowed"))
     if next_allowed and now < next_allowed:
-        print(
-            json.dumps(
-                {
-                    "status": "skipped_due_to_lockout",
-                    "next_attempt_after": progress.get("next_allowed"),
-                }
-            )
+        emit_json(
+            {
+                "status": "skipped_due_to_lockout",
+                "next_attempt_after": progress.get("next_allowed"),
+            }
         )
         return
     if progress.get("next_allowed"):
@@ -497,7 +504,7 @@ def main():
     if missing_bins:
         msg = f"Missing executables: {', '.join(missing_bins)}"
         logging.error(msg)
-        print(json.dumps({"error": msg}))
+        emit_json({"error": msg})
         sys.exit(4)
 
     notes: List[str] = []
@@ -522,7 +529,7 @@ def main():
             progress = load_progress(address)
             if progress.get("next_allowed"):
                 err["next_attempt_after"] = progress["next_allowed"]
-            print(json.dumps(err))
+            emit_json(err)
             return
 
         if auth_report is None:
@@ -533,7 +540,7 @@ def main():
         try:
             camera = ONVIFCamera(address, port, username, password)
         except Exception as exc:
-            print(json.dumps({"status": "onvif_error", "error": str(exc)}))
+            emit_json({"status": "onvif_error", "error": str(exc)})
             return
 
         device_snapshot, usernames, warnings = _collect_device_snapshot(camera)
@@ -674,23 +681,23 @@ def main():
         if best_url:
             payload["rtsp_best_uri"] = best_url
 
-        print(json.dumps(payload, ensure_ascii=False, default=str))
+        emit_json(payload, default=str)
 
     except Fault as fault:
         logging.error("ONVIF Fault: %s", fault, exc_info=True)
-        print(json.dumps({"error": f"ONVIF Fault: {fault}"}))
+        emit_json({"error": f"ONVIF Fault: {fault}"})
         sys.exit(6)
     except ONVIFError as err:
         logging.error("ONVIF Error: %s", err, exc_info=True)
-        print(json.dumps({"error": f"ONVIF Error: {err}"}))
+        emit_json({"error": f"ONVIF Error: {err}"})
         sys.exit(6)
     except socket.error as err:
         logging.error("Socket Error: %s", err, exc_info=True)
-        print(json.dumps({"error": f"Socket Error: {err}"}))
+        emit_json({"error": f"Socket Error: {err}"})
         sys.exit(5)
     except Exception as exc:
         logging.critical("Unexpected Error: %s", exc, exc_info=True)
-        print(json.dumps({"error": f"Unexpected Error: {exc}"}))
+        emit_json({"error": f"Unexpected Error: {exc}"})
         sys.exit(7)
     finally:
         remove_progress(address)
