@@ -511,6 +511,7 @@ def main():
     port = None
     password = args.password
     auth_report = None
+    should_clear_progress = False
 
     try:
         for _ in range(MAX_MAIN_ATTEMPTS):
@@ -682,6 +683,7 @@ def main():
             payload["rtsp_best_uri"] = best_url
 
         emit_json(payload, default=str)
+        should_clear_progress = next_attempt_after is None
 
     except Fault as fault:
         logging.error("ONVIF Fault: %s", fault, exc_info=True)
@@ -700,7 +702,17 @@ def main():
         emit_json({"error": f"Unexpected Error: {exc}"})
         sys.exit(7)
     finally:
-        remove_progress(address)
+        if should_clear_progress:
+            progress_state = load_progress(address)
+            next_allowed_dt = _parse_iso(progress_state.get("next_allowed"))
+            if next_allowed_dt and datetime.datetime.utcnow() < next_allowed_dt:
+                logging.debug(
+                    "Keeping progress for %s due to active backoff until %s",
+                    address,
+                    progress_state.get("next_allowed"),
+                )
+            else:
+                remove_progress(address)
 
 
 if __name__ == "__main__":
