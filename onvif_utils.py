@@ -770,10 +770,12 @@ def find_working_credentials(
 
     baseline_password = None
     port = None
+    should_remove_baseline = False
     if baseline:
         baseline_password = baseline.get("password")
         port = baseline.get("port")
-        if baseline_password and baseline_password not in tried_passwords:
+        has_baseline_password = baseline_password is not None
+        if has_baseline_password and baseline_password not in tried_passwords:
             if attempts_this_run >= MAX_PASSWORD_ATTEMPTS:
                 return None, None, None
             mark_tried(baseline_password)
@@ -786,21 +788,24 @@ def find_working_credentials(
                     remove_baseline(ip)
                     return record_lock(report.get("lock_seconds", 31 * 60))
                 if report and report.get("final_verdict") == "WRONG_CREDS":
-                    remove_baseline(ip)
+                    should_remove_baseline = True
                     baseline_password = None
                     port = None
-        if baseline_password:
+        if has_baseline_password and baseline_password is not None and not should_remove_baseline:
             port_info = find_onvif_port(ip, ports, username=username, password=baseline_password)
             status = port_info.get("status")
             if status == "locked":
                 remove_baseline(ip)
                 return record_lock(port_info.get("lock_seconds", 31 * 60))
             if status == "unauthorized":
-                remove_baseline(ip)
+                should_remove_baseline = True
                 baseline_password = None
             if status == "success":
                 return port_info["port"], baseline_password, port_info.get("report")
-        remove_baseline(ip)
+        if not has_baseline_password:
+            should_remove_baseline = True
+        if should_remove_baseline:
+            remove_baseline(ip)
 
     for pw in PASSWORDS:
         if attempts_this_run >= MAX_PASSWORD_ATTEMPTS:

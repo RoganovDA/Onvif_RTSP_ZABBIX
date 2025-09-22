@@ -60,12 +60,16 @@ def validate_address(address, timeout=5):
         except OSError:
             if not HOSTNAME_RE.fullmatch(address or ""):
                 return False, "Invalid address"
+            original = socket.getdefaulttimeout()
             try:
-                original = socket.getdefaulttimeout()
                 socket.setdefaulttimeout(timeout)
-                socket.gethostbyname(address)
-                return True, None
+                result = socket.getaddrinfo(address, None, socket.AF_UNSPEC)
+                if result:
+                    return True, None
+                return False, "DNS resolution failed"
             except socket.gaierror:
+                return False, "DNS resolution failed"
+            except OSError:
                 return False, "DNS resolution failed"
             finally:
                 socket.setdefaulttimeout(original)
