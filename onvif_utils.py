@@ -557,6 +557,7 @@ def try_onvif_connection(
     )
 
     auth_summary = auth_phase["summary"]
+    anon_open = set(anonymous_phase["summary"].get("open", []))
     auth_open = set(auth_summary["open"])
     auth_unauthorized = set(auth_summary["unauthorized"])
     auth_not_supported = set(auth_summary["not_supported"])
@@ -586,7 +587,13 @@ def try_onvif_connection(
             else:
                 final_verdict = "LIMITED_ONVIF"
         else:
-            if auth_unauthorized or "unauthorized" in error_categories:
+            if (
+                auth_open <= anon_open
+                and auth_open
+                and (auth_unauthorized or "unauthorized" in error_categories)
+            ):
+                final_verdict = "WRONG_CREDS"
+            elif auth_unauthorized or "unauthorized" in error_categories:
                 final_verdict = "INSUFFICIENT_ROLE"
             elif media_denied:
                 final_verdict = "INSUFFICIENT_ROLE"
