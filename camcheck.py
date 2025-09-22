@@ -332,9 +332,18 @@ def _collect_device_snapshot(camera):
             ipv4 = getattr(entry, "IPv4", None)
             config = getattr(ipv4, "Config", None) if ipv4 else None
             from_dhcp = getattr(config, "FromDHCP", None) if config else None
+            manual = getattr(config, "Manual", None) if config else None
+            dhcp_address = getattr(from_dhcp, "Address", None) if from_dhcp else None
+            manual_address = None
+            if not dhcp_address and manual:
+                manual_entries = manual if isinstance(manual, list) else [manual]
+                for manual_entry in manual_entries:
+                    manual_address = getattr(manual_entry, "Address", None)
+                    if manual_address:
+                        break
             snapshot["network"] = {
                 "hw_address": getattr(info, "HwAddress", None) if info else None,
-                "ipv4": getattr(from_dhcp, "Address", None) if from_dhcp else None,
+                "ipv4": dhcp_address or manual_address,
             }
     else:
         _apply_call_status(snapshot, "network_interfaces", interfaces, warnings, "GetNetworkInterfaces")
