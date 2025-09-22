@@ -13,4 +13,9 @@ def parse_args(argv=None):
         default=3,
         help="Timeout in seconds for reachability check",
     )
+    parser.add_argument(
+        "--full-output",
+        action="store_true",
+        help="Emit the extended audit payload instead of the legacy flat JSON",
+    )
     return parser.parse_args(argv)
