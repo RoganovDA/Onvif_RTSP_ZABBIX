@@ -137,6 +137,11 @@ def load_baseline(ip):
             "rtsp_best_path": None,
             "cooldown_until": None,
             "rtsp_attempts": [],
+            "rtsp_color_analysis": None,
+            "rtsp_color_channels": None,
+            "rtsp_color_balance": None,
+            "rtsp_color_ratios": None,
+            "rtsp_color_variance": None,
         }
         save_baseline(ip, upgraded)
         logging.info("Upgraded old baseline format for %s", ip)
@@ -158,6 +163,11 @@ def load_baseline(ip):
         "rtsp_best_path": None,
         "cooldown_until": None,
         "rtsp_attempts": [],
+        "rtsp_color_analysis": None,
+        "rtsp_color_channels": None,
+        "rtsp_color_balance": None,
+        "rtsp_color_ratios": None,
+        "rtsp_color_variance": None,
     }
     for key, default in defaults.items():
         if key not in data or data[key] is None:

@@ -18,7 +18,12 @@ except Exception as exc:  # pragma: no cover - import guard
 else:  # pragma: no cover - simple assignment
     CV2_IMPORT_ERROR = None
 
-from param import CV2_OPEN_TIMEOUT_MS, CV2_READ_TIMEOUT_MS
+from param import (
+    CV2_OPEN_TIMEOUT_MS,
+    CV2_READ_TIMEOUT_MS,
+    COLOR_CHANNEL_NAMES,
+    interpret_color_metrics,
+)
 
 if os.name == "nt":
     import selectors
@@ -69,11 +74,89 @@ def suppress_stderr():
             os.close(saved_stderr_fd)
 
 
+def _extract_channel_means(frame):
+    if frame is None or frame.size == 0:
+        return None
+    if frame.ndim == 2:
+        value = float(np.mean(frame))
+        return np.array([value, value, value], dtype=np.float32)
+    if frame.ndim == 3 and frame.shape[-1] == 1:
+        value = float(np.mean(frame[..., 0]))
+        return np.array([value, value, value], dtype=np.float32)
+    if frame.ndim == 3 and frame.shape[-1] >= 3:
+        channels = frame[..., :3].astype(np.float32, copy=False)
+        reshaped = channels.reshape((-1, 3))
+        return reshaped.mean(axis=0)
+    return None
+
+
+def _finalize_color_stats(channel_series, frame_count):
+    if not channel_series or frame_count <= 0:
+        analysis = interpret_color_metrics(
+            channel_means=None,
+            channel_ratios=None,
+            channel_variance=None,
+            normalized_channels=None,
+            frame_count=frame_count,
+            dominant_channel=None,
+        )
+        return {
+            "avg_color_channels": None,
+            "color_channel_variance": None,
+            "color_channel_ratios": None,
+            "color_channel_balance": None,
+            "color_analysis": analysis,
+        }
+
+    arr = np.vstack(channel_series).astype(np.float32, copy=False)
+    averages = arr.mean(axis=0)
+    variances = arr.var(axis=0)
+    total = float(np.sum(averages))
+    if total <= 0:
+        normalized = np.zeros_like(averages)
+    else:
+        normalized = averages / total
+    ratios = {
+        "blue_green": float(averages[0] / max(averages[1], 1e-6)),
+        "red_green": float(averages[2] / max(averages[1], 1e-6)),
+        "red_blue": float(averages[2] / max(averages[0], 1e-6)),
+        "green_blue": float(averages[1] / max(averages[0], 1e-6)),
+        "green_red": float(averages[1] / max(averages[2], 1e-6)),
+        "max_min": float(np.max(averages) / max(np.min(averages), 1e-6)),
+    }
+    channel_means = {
+        COLOR_CHANNEL_NAMES[i]: float(averages[i]) for i in range(len(COLOR_CHANNEL_NAMES))
+    }
+    channel_variance = {
+        COLOR_CHANNEL_NAMES[i]: float(variances[i]) for i in range(len(COLOR_CHANNEL_NAMES))
+    }
+    channel_balance = {
+        COLOR_CHANNEL_NAMES[i]: float(normalized[i]) for i in range(len(COLOR_CHANNEL_NAMES))
+    }
+    dominant = COLOR_CHANNEL_NAMES[int(np.argmax(averages))]
+    analysis = interpret_color_metrics(
+        channel_means=channel_means,
+        channel_ratios=ratios,
+        channel_variance=channel_variance,
+        normalized_channels=channel_balance,
+        frame_count=frame_count,
+        dominant_channel=dominant,
+    )
+    return {
+        "avg_color_channels": {k: round(v, 2) for k, v in channel_means.items()},
+        "color_channel_variance": {k: round(v, 2) for k, v in channel_variance.items()},
+        "color_channel_ratios": {k: round(v, 3) for k, v in ratios.items()},
+        "color_channel_balance": {k: round(v, 4) for k, v in channel_balance.items()},
+        "color_analysis": analysis,
+    }
+
+
 def analyze_frames(cap, duration):
     start_time = time.time()
     frames, sizes, brightness, change_levels = 0, [], [], []
     prev_gray = None
     width = height = None
+    channel_series = []
 
     while time.time() - start_time < duration:
         ret, frame = cap.read()
@@ -93,7 +176,11 @@ def analyze_frames(cap, duration):
             change_levels.append(delta)
         prev_gray = gray
 
-    return {
+        channel_means = _extract_channel_means(frame)
+        if channel_means is not None:
+            channel_series.append(channel_means)
+
+    stats = {
         "frames": frames,
         "sizes": sizes,
         "brightness": brightness,
@@ -101,6 +188,8 @@ def analyze_frames(cap, duration):
         "width": width,
         "height": height,
     }
+    stats.update(_finalize_color_stats(channel_series, frames))
+    return stats
 
 
 def _convert_to_gray(frame):
@@ -126,6 +215,18 @@ def check_rtsp_stream(url, timeout=5, duration=5.0):
         "frame_change_level": 0.0,
         "real_fps": 0.0,
         "note": "Unable to determine stream resolution",
+        "avg_color_channels": None,
+        "color_channel_variance": None,
+        "color_channel_ratios": None,
+        "color_channel_balance": None,
+        "color_analysis": interpret_color_metrics(
+            channel_means=None,
+            channel_ratios=None,
+            channel_variance=None,
+            normalized_channels=None,
+            frame_count=0,
+            dominant_channel=None,
+        ),
     }
 
     if cv2 is None:
@@ -180,6 +281,16 @@ def check_rtsp_stream(url, timeout=5, duration=5.0):
 
         stats = analyze_frames(cap, duration)
         cap.release()
+
+    for key in (
+        "avg_color_channels",
+        "color_channel_variance",
+        "color_channel_ratios",
+        "color_channel_balance",
+        "color_analysis",
+    ):
+        if key in stats:
+            result[key] = stats[key]
 
     frames = stats["frames"]
     width = stats["width"]
@@ -319,6 +430,18 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
             "frame_change_level": 0.0,
             "real_fps": 0.0,
             "note": "Failed to open stream",
+            "avg_color_channels": None,
+            "color_channel_variance": None,
+            "color_channel_ratios": None,
+            "color_channel_balance": None,
+            "color_analysis": interpret_color_metrics(
+                channel_means=None,
+                channel_ratios=None,
+                channel_variance=None,
+                normalized_channels=None,
+                frame_count=0,
+                dominant_channel=None,
+            ),
         }
         stats = {
             "frames": 0,
@@ -376,6 +499,17 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
                 "OpenCV is not available, skipping direct capture: %s",
                 CV2_IMPORT_ERROR,
             )
+
+        if stats:
+            for key in (
+                "avg_color_channels",
+                "color_channel_variance",
+                "color_channel_ratios",
+                "color_channel_balance",
+                "color_analysis",
+            ):
+                if key in stats:
+                    result[key] = stats[key]
 
         if stats["frames"] > 0:
             result.update({
@@ -457,6 +591,7 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
             prev_gray = None
             start_time = time.time()
             expected_len = width * height * 3
+            channel_series = []
 
             while time.time() - start_time < duration:
                 raw = read_exact(pipe.stdout, expected_len, poller, timeout)
@@ -478,6 +613,10 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
                     delta = float(np.mean(np.abs(gray - prev_gray)))
                     change_levels.append(delta)
                 prev_gray = gray
+
+                channel_means = _extract_channel_means(frame)
+                if channel_means is not None:
+                    channel_series.append(channel_means)
 
             poller.unregister(pipe.stdout)
             pipe.terminate()
@@ -502,6 +641,7 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
                         mask_credentials(rtsp_url),
                         stderr_data.strip(),
                     )
+                color_stats = _finalize_color_stats(channel_series, frames)
                 result.update({
                     "status": "ok",
                     "frames_read": frames,
@@ -513,6 +653,7 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
                     "real_fps": round(frames / duration, 2),
                     "note": "Read via ffmpeg pipe",
                 })
+                result.update(color_stats)
                 attempt.update({"status": "OK", "method": "ffmpeg", "note": result["note"]})
             else:
                 logging.warning(
@@ -582,4 +723,20 @@ def check_rtsp_stream_with_fallback(url, timeout=5, duration=5.0):
     final_result["attempts"] = attempts
     if best_attempt:
         final_result["best_attempt"] = best_attempt
+    for key in (
+        "avg_color_channels",
+        "color_channel_variance",
+        "color_channel_ratios",
+        "color_channel_balance",
+    ):
+        final_result.setdefault(key, None)
+    if not final_result.get("color_analysis"):
+        final_result["color_analysis"] = interpret_color_metrics(
+            channel_means=None,
+            channel_ratios=None,
+            channel_variance=None,
+            normalized_channels=None,
+            frame_count=final_result.get("frames_read", 0) or 0,
+            dominant_channel=None,
+        )
     return final_result

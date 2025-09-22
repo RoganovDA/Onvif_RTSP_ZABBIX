@@ -6,7 +6,7 @@ import re
 import shutil
 import socket
 import sys
-from typing import Any, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 from onvif import ONVIFCamera
@@ -191,6 +191,11 @@ def _summarize_rtsp_result(result):
         "attempts": summarized_attempts,
         "best_attempt": best_attempt,
         "summary": summary,
+        "avg_color_channels": result.get("avg_color_channels"),
+        "color_channel_variance": result.get("color_channel_variance"),
+        "color_channel_ratios": result.get("color_channel_ratios"),
+        "color_channel_balance": result.get("color_channel_balance"),
+        "color_analysis": result.get("color_analysis"),
     }
     return payload
 
@@ -252,7 +257,99 @@ def _standardize_rtsp_result(result, default_status="error", default_note=""):
         "real_fps": result.get("real_fps", 0.0),
         "attempts": result.get("attempts", []),
         "best_attempt": result.get("best_attempt"),
+        "avg_color_channels": result.get("avg_color_channels"),
+        "color_channel_variance": result.get("color_channel_variance"),
+        "color_channel_ratios": result.get("color_channel_ratios"),
+        "color_channel_balance": result.get("color_channel_balance"),
+        "color_analysis": result.get("color_analysis"),
     }
+
+
+def _map_final_verdict(verdict: Optional[str]) -> str:
+    if verdict is None:
+        return "unknown"
+    mapping = {
+        "AUTH_OK": "success",
+        "WRONG_CREDS": "unauthorized",
+        "LOCKED": "locked",
+        "LIMITED_ONVIF": "limited",
+        "INSUFFICIENT_ROLE": "insufficient_role",
+    }
+    normalized = mapping.get(str(verdict).upper())
+    if normalized:
+        return normalized
+    return str(verdict).lower()
+
+
+def _build_legacy_payload(
+    address: str,
+    payload: Dict[str, Any],
+    *,
+    rtsp_port: Optional[int] = None,
+    rtsp_path: Optional[str] = None,
+    baseline_created: bool,
+):
+    camera = payload.get("camera") or {}
+    device = camera.get("device") or {}
+    network = camera.get("network") or {}
+    time_info = camera.get("time") or {}
+    users = camera.get("users") or {}
+    user_changes = users.get("changes") or {}
+    new_users = user_changes.get("new") or []
+    removed_users = user_changes.get("removed") or []
+    rtsp_phase = (payload.get("phase") or {}).get("rtsp_fallback", {}) or {}
+    best_attempt = rtsp_phase.get("best_attempt") or {}
+    best_port = rtsp_port or best_attempt.get("port")
+    best_path = rtsp_path or payload.get("rtsp_best_path") or best_attempt.get("path")
+    color_analysis = rtsp_phase.get("color_analysis") or {}
+    dns_value = network.get("dns") or network.get("ntp")
+    ip_value = network.get("ipv4") or address
+    legacy = {
+        "Manufacturer": device.get("manufacturer"),
+        "Model": device.get("model"),
+        "FirmwareVersion": device.get("firmware"),
+        "SerialNumber": device.get("serial"),
+        "HardwareId": device.get("hardware_id"),
+        "HwAddress": network.get("hw_address"),
+        "Address": ip_value,
+        "DNSname": dns_value,
+        "TimeSyncOK": time_info.get("in_sync"),
+        "TimeDifferenceSeconds": time_info.get("offset_seconds"),
+        "ONVIFStatus": _map_final_verdict(payload.get("final_verdict")),
+        "NewUsersDetected": bool(new_users),
+        "NewUsernames": new_users,
+        "RemovedUsernames": removed_users,
+        "BaselineCreated": baseline_created,
+        "UserCount": users.get("count"),
+        "RTSPPort": best_port,
+        "RTSPPath": best_path,
+        "RTSPTransport": best_attempt.get("transport"),
+        "RTSPBestURI": payload.get("rtsp_best_uri") or best_attempt.get("url"),
+        "status": rtsp_phase.get("status"),
+        "frames_read": rtsp_phase.get("frames_read"),
+        "avg_frame_size_kb": rtsp_phase.get("avg_frame_size_kb"),
+        "width": rtsp_phase.get("width"),
+        "height": rtsp_phase.get("height"),
+        "avg_brightness": rtsp_phase.get("avg_brightness"),
+        "frame_change_level": rtsp_phase.get("frame_change_level"),
+        "real_fps": rtsp_phase.get("real_fps"),
+        "note": rtsp_phase.get("note"),
+        "ColorDiagnosis": color_analysis.get("diagnosis"),
+        "ColorConfidence": color_analysis.get("confidence"),
+        "ColorStability": color_analysis.get("stability"),
+        "ColorDominantChannel": color_analysis.get("dominant_channel"),
+        "ColorTriggeredMetrics": color_analysis.get("triggered_metrics"),
+        "ColorMaxVariance": color_analysis.get("max_variance"),
+        "ColorMaxRatio": color_analysis.get("max_ratio"),
+        "ColorFrameCount": color_analysis.get("frame_count"),
+        "ColorReason": color_analysis.get("reason"),
+        "ColorRatios": rtsp_phase.get("color_channel_ratios"),
+        "ColorBalance": rtsp_phase.get("color_channel_balance"),
+        "ColorChannels": rtsp_phase.get("avg_color_channels"),
+        "Notes": list(payload.get("notes") or []),
+        "NextAttemptAfter": payload.get("next_attempt_after"),
+    }
+    return legacy
 
 
 def _run_rtsp_candidate_fallback(address, username, password, port_candidates, path_candidates):
@@ -447,6 +544,7 @@ def main():
         sys.exit(1)
 
     baseline = load_baseline(address)
+    baseline_created_flag = baseline is None
     reachability_hints = []
     if baseline:
         reachability_hints.extend(
@@ -597,6 +695,17 @@ def main():
         if rtsp_path:
             rtsp_path = normalize_rtsp_path(rtsp_path)
 
+        color_analysis = rtsp_phase.get("color_analysis") or {}
+        diagnosis = color_analysis.get("diagnosis")
+        if diagnosis and diagnosis not in {"balanced", "unknown"}:
+            confidence = color_analysis.get("confidence")
+            if isinstance(confidence, (int, float)):
+                notes.append(
+                    f"Color cast detected: {diagnosis} (confidence {confidence:.2f})"
+                )
+            else:
+                notes.append(f"Color cast detected: {diagnosis}")
+
         baseline_users = (baseline or {}).get("users", [])
         user_changes = {}
         if baseline_users:
@@ -637,6 +746,11 @@ def main():
             "rtsp_best_path": None,
             "cooldown_until": None,
             "rtsp_attempts": [],
+            "rtsp_color_analysis": None,
+            "rtsp_color_channels": None,
+            "rtsp_color_balance": None,
+            "rtsp_color_ratios": None,
+            "rtsp_color_variance": None,
         }
         baseline_data["users"] = usernames
         baseline_data["password"] = password
@@ -649,6 +763,11 @@ def main():
         baseline_data["rtsp_best_path"] = best_path
         baseline_data["rtsp_attempts"] = rtsp_phase.get("attempts", [])
         baseline_data["cooldown_until"] = None
+        baseline_data["rtsp_color_analysis"] = rtsp_phase.get("color_analysis")
+        baseline_data["rtsp_color_channels"] = rtsp_phase.get("avg_color_channels")
+        baseline_data["rtsp_color_balance"] = rtsp_phase.get("color_channel_balance")
+        baseline_data["rtsp_color_ratios"] = rtsp_phase.get("color_channel_ratios")
+        baseline_data["rtsp_color_variance"] = rtsp_phase.get("color_channel_variance")
 
         if final_verdict == "LOCKED" and lock_seconds:
             lock_until_dt = datetime.datetime.utcnow() + datetime.timedelta(seconds=lock_seconds)
@@ -686,7 +805,17 @@ def main():
         if best_url:
             payload["rtsp_best_uri"] = best_url
 
-        emit_json(payload, default=str)
+        if args.full_output:
+            emit_json(payload, default=str)
+        else:
+            legacy_payload = _build_legacy_payload(
+                address,
+                payload,
+                rtsp_port=rtsp_port,
+                rtsp_path=rtsp_path,
+                baseline_created=baseline_created_flag,
+            )
+            emit_json(legacy_payload, default=str)
         should_clear_progress = next_attempt_after is None
 
     except Fault as fault:
