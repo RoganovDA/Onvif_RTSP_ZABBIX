@@ -1,0 +1,325 @@
+zabbix_export:
+  version: '7.2'
+  template_groups:
+    - uuid: 215abbab93df48cab8aea43b5c915f2d
+      name: 'Security Cameras - AllCamers'
+  templates:
+    - uuid: aef49f641ed64a298a8c03990057b7de
+      template: ALL_CAM_Check
+      name: ALL_CAM_Check
+      templates:
+        - name: 'ICMP Ping'
+      groups:
+        - name: 'Security Cameras - AllCamers'
+      items:
+        - uuid: 77c3d3d384d443d4bbd075fdae70a2e9
+          name: 'IP-адрес (внутренний)'
+          type: DEPENDENT
+          key: cam.address
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.Address
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: fa0237cd952242c7b47519f70bec1824
+          name: 'Средняя яркость'
+          type: DEPENDENT
+          key: cam.avg_brightness
+          value_type: FLOAT
+          trends: '0'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.avg_brightness
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: e5a2fe0bc38548ce85436157da932beb
+          name: 'Средний размер кадра (KB)'
+          type: DEPENDENT
+          key: cam.avg_frame_kb
+          value_type: FLOAT
+          trends: '0'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.avg_frame_size_kb
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: 589e4acace2f43d689c8a728d63b2335
+          name: 'Базовая запись создана'
+          type: DEPENDENT
+          key: cam.baseline_created
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.BaselineCreated
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: 102f45208076474b92d781a6e6e3c018
+          name: 'Имя DNS сервера'
+          type: DEPENDENT
+          key: cam.dns_name
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.DNSname
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+          triggers:
+            - uuid: 00db56fbc26e495ab730cab0f2631417
+              expression: 'last(/ALL_CAM_Check/cam.dns_name)<>"ntp.syshleb.ru"'
+              recovery_mode: RECOVERY_EXPRESSION
+              recovery_expression: 'last(/ALL_CAM_Check/cam.dns_name)="ntp.syshleb.ru"'
+              name: 'NTP-сервер камеры не соответствует ntp.syshleb.ru'
+              event_name: 'NTP-сервер камеры не соответствует ntp.syshleb.ru'
+              priority: INFO
+        - uuid: 442ac19512e9446588dddf3fc19fb626
+          name: 'Версия прошивки'
+          type: DEPENDENT
+          key: cam.firmware
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.FirmwareVersion
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: 57e017f8f5664b1faf6da539fb658fc3
+          name: 'Кадров считано'
+          type: DEPENDENT
+          key: cam.frames_read
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.frames_read
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: 2353b34fe5ee462dbfb17b92d188dd8f
+          name: 'Hardware ID'
+          type: DEPENDENT
+          key: cam.hardware_id
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.HardwareId
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: ed2ecc8b43a84d0899078fd8f20e4e3d
+          name: 'MAC-адрес камеры'
+          type: DEPENDENT
+          key: cam.hw_mac
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.HwAddress
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: 9373bf326d614ae0ad5a4934b2411ef6
+          name: 'Производитель камеры'
+          type: DEPENDENT
+          key: cam.manufacturer
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.Manufacturer
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: dc176a8ac0b7489b9c840973611662f3
+          name: 'Модель камеры'
+          type: DEPENDENT
+          key: cam.model
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.Model
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: 945bc47f5fd34ff1b0a368afef9285d6
+          name: 'Уровень движения'
+          type: DEPENDENT
+          key: cam.motion_level
+          value_type: FLOAT
+          trends: '0'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.frame_change_level
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: 6bc846f78a1b4950b50278f2c3e00235
+          name: 'Список новых пользователей'
+          type: DEPENDENT
+          key: cam.new_usernames
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.NewUsernames
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: f76391cab3cb492598aa070eb82a0bdd
+          name: 'Новые пользователи'
+          type: DEPENDENT
+          key: cam.new_users
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.NewUsersDetected
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+          triggers:
+            - uuid: e0e135336bdc40e08cad59aff5677860
+              expression: 'last(/ALL_CAM_Check/cam.new_users)="true"'
+              recovery_mode: RECOVERY_EXPRESSION
+              recovery_expression: 'last(/ALL_CAM_Check/cam.new_users)="false"'
+              name: 'Обнаружены новые пользователи'
+              event_name: '👤 Обнаружены новые пользователи'
+              priority: WARNING
+              manual_close: 'YES'
+        - uuid: 64539dfde250422599556345ef75c34c
+          name: 'FPS (кадров/сек)'
+          type: DEPENDENT
+          key: cam.real_fps
+          value_type: FLOAT
+          trends: '0'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.real_fps
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: e4fdd22775f54997a85a412057e116a7
+          name: 'Разрешение (собранное)'
+          type: DEPENDENT
+          key: cam.resolution
+          value_type: TEXT
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var data = JSON.parse(value);
+                  return data.width + "x" + data.height;
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: b21a99e50079498eba28031086247d71
+          name: RTSP-путь
+          type: DEPENDENT
+          key: cam.rtsp_path
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.RTSPPath
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: ec3a1768341e4de5b36a22fc7a08b611
+          name: RTSP-порт
+          type: DEPENDENT
+          key: cam.rtsp_port
+          trends: '0'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.RTSPPort
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: 69df21bf76e849f788f54d7d062fd66a
+          name: 'Серийный номер'
+          type: DEPENDENT
+          key: cam.serial
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.SerialNumber
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: 0712ad60cc2345fc9ee18ac91ecdfcd9
+          name: 'Статус потока'
+          type: DEPENDENT
+          key: cam.status
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.status
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+          triggers:
+            - uuid: 3b692aa74bd14c86a716e9c261a2a14a
+              expression: 'last(/ALL_CAM_Check/cam.status)="error"'
+              recovery_mode: RECOVERY_EXPRESSION
+              recovery_expression: 'last(/ALL_CAM_Check/cam.status)="ok"'
+              name: 'Камера недоступна'
+              event_name: '📡 Камера недоступна'
+              priority: WARNING
+              manual_close: 'YES'
+        - uuid: 7bbe68f20d2947f18e082899a19d9bf6
+          name: 'Разница времени (сек.)'
+          type: DEPENDENT
+          key: cam.time_diff_sec
+          trends: '0'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.TimeDifferenceSeconds
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: 95539e268f664bcf9e26c9e6b3068fc7
+          name: 'Синхронизация времени'
+          type: DEPENDENT
+          key: cam.time_sync_ok
+          value_type: TEXT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.TimeSyncOK
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+          triggers:
+            - uuid: 145cb82f1b254f998d221b718823803c
+              expression: 'last(/ALL_CAM_Check/cam.time_sync_ok)="false"'
+              recovery_mode: RECOVERY_EXPRESSION
+              recovery_expression: 'last(/ALL_CAM_Check/cam.time_sync_ok)="true"'
+              name: 'Несинхронизированное время'
+              event_name: '⏰ Несинхронизированное время'
+              priority: WARNING
+              type: MULTIPLE
+              manual_close: 'YES'
+        - uuid: 89ba9e88bbd34665812fafb77794c4c1
+          name: 'Кол-во пользователей'
+          type: DEPENDENT
+          key: cam.user_count
+          trends: '0'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.UserCount
+          master_item:
+            key: 'camcheck.py[{HOST.CONN}]'
+        - uuid: 054eae93091748c7930e214ef889ebdd
+          name: JSON_RAW
+          type: EXTERNAL
+          key: 'camcheck.py[{HOST.CONN}]'
+          delay: 10m
+          history: 1d
+          value_type: TEXT
+      macros:
+        - macro: '{$CAMERA_IP}'
+          value: '{HOST.CONN}'
+  triggers:
+    - uuid: 24a64ca59d2c4564bfe3b2ee96858b98
+      expression: 'change(/ALL_CAM_Check/cam.serial)=1 or change(/ALL_CAM_Check/cam.model)=1'
+      name: 'Возможная замена камеры (модель или серийный номер изменились)'
+      priority: WARNING
+      manual_close: 'YES'
