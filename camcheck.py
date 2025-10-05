@@ -6,7 +6,6 @@ import re
 import shutil
 import socket
 import sys
-import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -518,14 +517,6 @@ def _collect_device_snapshot(camera):
 
 
 def main():
-    start_time = time.monotonic()
-
-    def emit_with_duration(payload: Any) -> None:
-        elapsed = max(time.monotonic() - start_time, 0.0)
-        if isinstance(payload, dict):
-            payload.setdefault("ExecutionSeconds", round(elapsed, 3))
-        emit_json(payload, default=str)
-
     args = parse_args()
 
     log_kwargs = {
@@ -543,13 +534,13 @@ def main():
     logging.basicConfig(**log_kwargs)
 
     if not args.address:
-        emit_with_duration({"error": "Usage: camcheck.py <ADDRESS>"})
+        emit_json({"error": "Usage: camcheck.py <ADDRESS>"})
         sys.exit(1)
 
     address = args.address
     valid, err_msg = validate_address(address, args.ping_timeout)
     if not valid:
-        emit_with_duration({"error": err_msg or "Invalid address"})
+        emit_json({"error": err_msg or "Invalid address"})
         sys.exit(1)
 
     baseline = load_baseline(address)
@@ -563,7 +554,7 @@ def main():
     reachability_hints.append(DEFAULT_RTSP_PORT)
     reachability_ports = _unique_preserve(reachability_hints)
     if not is_reachable(address, args.ping_timeout, ports=reachability_ports):
-        emit_with_duration({"error": "Host unreachable"})
+        emit_json({"error": "Host unreachable"})
         sys.exit(5)
 
     username = args.username or DEFAULT_USERNAME
@@ -579,11 +570,11 @@ def main():
             }
             if baseline.get("lockout_message"):
                 payload["reason"] = baseline.get("lockout_message")
-            emit_with_duration(payload)
+            emit_json(payload)
             return
         cooldown_until = _parse_iso(baseline.get("cooldown_until"))
         if cooldown_until and now < cooldown_until:
-            emit_with_duration(
+            emit_json(
                 {
                     "status": "skipped_due_to_backoff",
                     "cooldown_until": baseline.get("cooldown_until"),
@@ -598,7 +589,7 @@ def main():
 
     next_allowed = _parse_iso(progress.get("next_allowed"))
     if next_allowed and now < next_allowed:
-        emit_with_duration(
+        emit_json(
             {
                 "status": "skipped_due_to_lockout",
                 "next_attempt_after": progress.get("next_allowed"),
@@ -615,7 +606,7 @@ def main():
     if missing_bins:
         msg = f"Missing executables: {', '.join(missing_bins)}"
         logging.error(msg)
-        emit_with_duration({"error": msg})
+        emit_json({"error": msg})
         sys.exit(4)
 
     notes: List[str] = []
@@ -641,7 +632,7 @@ def main():
             progress = load_progress(address)
             if progress.get("next_allowed"):
                 err["next_attempt_after"] = progress["next_allowed"]
-            emit_with_duration(err)
+            emit_json(err)
             return
 
         if auth_report is None:
@@ -652,7 +643,7 @@ def main():
         try:
             camera = ONVIFCamera(address, port, username, password)
         except Exception as exc:
-            emit_with_duration({"status": "onvif_error", "error": str(exc)})
+            emit_json({"status": "onvif_error", "error": str(exc)})
             return
 
         device_snapshot, usernames, warnings = _collect_device_snapshot(camera)
@@ -815,7 +806,7 @@ def main():
             payload["rtsp_best_uri"] = best_url
 
         if args.full_output:
-            emit_with_duration(payload)
+            emit_json(payload, default=str)
         else:
             legacy_payload = _build_legacy_payload(
                 address,
@@ -824,24 +815,24 @@ def main():
                 rtsp_path=rtsp_path,
                 baseline_created=baseline_created_flag,
             )
-            emit_with_duration(legacy_payload)
+            emit_json(legacy_payload, default=str)
         should_clear_progress = next_attempt_after is None
 
     except Fault as fault:
         logging.error("ONVIF Fault: %s", fault, exc_info=True)
-        emit_with_duration({"error": f"ONVIF Fault: {fault}"})
+        emit_json({"error": f"ONVIF Fault: {fault}"})
         sys.exit(6)
     except ONVIFError as err:
         logging.error("ONVIF Error: %s", err, exc_info=True)
-        emit_with_duration({"error": f"ONVIF Error: {err}"})
+        emit_json({"error": f"ONVIF Error: {err}"})
         sys.exit(6)
     except socket.error as err:
         logging.error("Socket Error: %s", err, exc_info=True)
-        emit_with_duration({"error": f"Socket Error: {err}"})
+        emit_json({"error": f"Socket Error: {err}"})
         sys.exit(5)
     except Exception as exc:
         logging.critical("Unexpected Error: %s", exc, exc_info=True)
-        emit_with_duration({"error": f"Unexpected Error: {exc}"})
+        emit_json({"error": f"Unexpected Error: {exc}"})
         sys.exit(7)
     finally:
         if should_clear_progress:
