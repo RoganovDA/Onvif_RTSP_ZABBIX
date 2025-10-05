@@ -1,4 +1,5 @@
 import datetime
+from email.utils import parsedate_to_datetime
 import logging
 import re
 import socket
@@ -31,14 +32,188 @@ from rtsp_utils import fallback_ffprobe
 
 STATUS_RE = re.compile(r"(?:HTTP\s*)?(?P<code>[1-5]\d{2})")
 REDIRECT_RE = re.compile(r"location[:=]\s*(?P<url>\S+)", re.IGNORECASE)
-LOCK_RE = re.compile(r"after\s+(\d+)\s*(second|minute|hour)", re.IGNORECASE)
+LOCK_RE = re.compile(
+    r""
+    r"(?:"
+    r"after|in|within|wait(?:ing)?|retry|try again(?: in| after)?|"
+    r"blocked(?: for)?|lock(?:ed)?(?: for)?|disabled(?: for)?|"
+    r"available in|please try again(?: in| after)?|please retry(?: in| after)?|"
+    r"cooldown(?: for| in)?|again in|again after"
+    r")\s*"
+    r"(?:approximately|about|around|approx(?:imately)?|~)?\s*"
+    r"(?:\(\s*)?"
+    r"(?P<value>\d+)"
+    r"(?:\s*\))?\s*"
+    r"(?P<unit>seconds?|second|minutes?|minute|hours?|hour|secs?|mins?|hrs?|s|m|h)"
+    r"",
+    re.IGNORECASE,
+)
+
+LOCK_TIME_PATTERNS = [
+    LOCK_RE,
+    re.compile(
+        r"(?:подождите|ожидайте)\s*(?P<value>\d+)\s*(?P<unit>секунд|сек|с|минут|мин|час|часа|часов)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"через\s*(?P<value>\d+)\s*(?P<unit>секунд|сек|с|минут|мин|час|часа|часов)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:на|в\s+течение)\s*(?P<value>\d+)\s*(?P<unit>секунд|сек|минут|мин|час|часа|часов)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?P<value>\d+)\s*(?P<unit>сек)(?:\b|\.|,)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:\(\s*)?(?P<value>\d+)(?:\s*\))?\s*(?P<unit>s|sec|secs|m|min|mins|h|hr|hrs)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?P<value>\d+)\s*(?P<unit>秒钟?|分鐘|分钟|分|小時|小时)(?:后|後|再试|再試)?",
+        re.IGNORECASE,
+    ),
+]
+
+LOCK_UNIT_FACTORS = {
+    "s": 1,
+    "sec": 1,
+    "secs": 1,
+    "second": 1,
+    "seconds": 1,
+    "сек": 1,
+    "секунд": 1,
+    "секунды": 1,
+    "секунда": 1,
+    "сек": 1,
+    "с": 1,
+    "мин": 60,
+    "минут": 60,
+    "минуты": 60,
+    "минуту": 60,
+    "minute": 60,
+    "minutes": 60,
+    "min": 60,
+    "mins": 60,
+    "m": 60,
+    "час": 3600,
+    "часа": 3600,
+    "часов": 3600,
+    "hour": 3600,
+    "hours": 3600,
+    "hr": 3600,
+    "hrs": 3600,
+    "h": 3600,
+    "ч": 3600,
+    "秒": 1,
+    "秒钟": 1,
+    "分鐘": 60,
+    "分钟": 60,
+    "分": 60,
+    "小時": 3600,
+    "小时": 3600,
+}
+
+LOCK_HTTP_STATUSES = {
+    423,
+    429,
+    430,
+    431,
+    439,
+    440,
+    449,
+    450,
+    451,
+    452,
+    456,
+    503,
+    529,
+    530,
+}
+
 LOCK_KEYWORDS = (
     "devicelocked",
     "locked",
+    "locked out",
+    "lockout",
+    "lock-out",
     "accountlocked",
     "passwordlocked",
+    "userlocked",
+    "account locked",
+    "account blocked",
+    "account disabled",
+    "account locked out",
+    "temporarily blocked",
+    "temporarily locked",
+    "temporarily locked out",
+    "temporarily disabled",
+    "temporarily unavailable",
+    "login blocked",
+    "login locked",
     "too many attempts",
     "too many failures",
+    "too many failed attempts",
+    "too many login attempts",
+    "too many login failures",
+    "too many logins",
+    "too many failed login attempts",
+    "too many authentication failures",
+    "exceeded maximum attempts",
+    "exceeded max attempts",
+    "exceeded max login attempts",
+    "exceeded maximum login attempts",
+    "exceeded number of attempts",
+    "retry later",
+    "retry after",
+    "retry in",
+    "try again later",
+    "try again in",
+    "please try again in",
+    "please try again later",
+    "please retry later",
+    "please retry in",
+    "слишком много попыток",
+    "слишком много неудачных попыток",
+    "слишком много попыток входа",
+    "учетная запись заблокирована",
+    "учётная запись заблокирована",
+    "аккаунт заблокирован",
+    "временно заблокирована",
+    "временно заблокирован",
+    "вход заблокирован",
+    "ожидайте",
+    "подождите",
+    "повторите позже",
+    "повторите попытку позже",
+    "用户已锁定",
+    "账户已锁定",
+    "帐号已锁定",
+    "账号被锁定",
+    "用户被锁定",
+    "账户被锁定",
+    "暂时锁定",
+    "过多的登录尝试",
+    "尝试过多",
+    "登录尝试过多",
+    "密码错误次数过多",
+)
+
+LOCK_FAULT_KEYWORDS = (
+    "accountlocked",
+    "passwordlocked",
+    "userlocked",
+    "devicelocked",
+    "toomanyfailedauthenticationattempts",
+    "maxfailedlogin",
+    "maxfailedlogins",
+    "maxfailedloginattempts",
+    "temporarilyblocked",
+    "temporarilylocked",
+    "temporarilyunavailable",
+    "lockout",
 )
 
 
@@ -112,14 +287,162 @@ def parse_datetime(dt_info):
         return None
 
 
-def parse_lock_time(message: str) -> Optional[int]:
-    match = LOCK_RE.search(message or "")
-    if not match:
+def _normalize_unit(unit: Optional[str]) -> Optional[str]:
+    if not unit:
         return None
-    value = int(match.group(1))
-    unit = match.group(2).lower()
-    factors = {"second": 1, "minute": 60, "hour": 3600}
-    return value * factors.get(unit, 1)
+    normalized = unit.strip().strip(".:;,!?)")
+    if not normalized:
+        return None
+    return normalized.lower()
+
+
+def parse_lock_time(message: str) -> Optional[int]:
+    if not message:
+        return None
+    for pattern in LOCK_TIME_PATTERNS:
+        match = pattern.search(message)
+        if not match:
+            continue
+        value_text = match.groupdict().get("value")
+        unit_text = match.groupdict().get("unit")
+        if not value_text:
+            continue
+        try:
+            value = int(value_text)
+        except (TypeError, ValueError):
+            continue
+        unit = _normalize_unit(unit_text)
+        if not unit:
+            continue
+        factor = LOCK_UNIT_FACTORS.get(unit)
+        if factor is None:
+            if unit.endswith("s") and unit[:-1] in LOCK_UNIT_FACTORS:
+                factor = LOCK_UNIT_FACTORS[unit[:-1]]
+            elif unit.endswith("es") and unit[:-2] in LOCK_UNIT_FACTORS:
+                factor = LOCK_UNIT_FACTORS[unit[:-2]]
+            elif unit.endswith("ов") and unit[:-2] in LOCK_UNIT_FACTORS:
+                factor = LOCK_UNIT_FACTORS[unit[:-2]]
+        if factor is None:
+            continue
+        seconds = value * factor
+        if seconds > 0:
+            return seconds
+    return None
+
+
+def _coerce_retry_after_value(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, datetime.timedelta):
+        seconds = int(value.total_seconds())
+        return max(seconds, 0)
+    if isinstance(value, (int, float)):
+        if value <= 0:
+            return 0 if value == 0 else None
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return int(text)
+        try:
+            numeric = float(text)
+            if numeric >= 0:
+                return int(numeric)
+        except ValueError:
+            pass
+        time_match = re.match(
+            r"(?P<value>\d+)\s*(?P<unit>seconds?|minutes?|hours?|secs?|mins?|hrs?|s|m|h)",
+            text,
+            re.IGNORECASE,
+        )
+        if time_match:
+            parsed = parse_lock_time(f"in {time_match.group(0)}")
+            if parsed is not None:
+                return parsed
+        header_match = re.search(r"retry-after[:=]\s*(\d+)", text, re.IGNORECASE)
+        if header_match:
+            return int(header_match.group(1))
+        try:
+            dt = parsedate_to_datetime(text)
+        except (TypeError, ValueError, OverflowError):
+            dt = None
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            delta = (dt - now).total_seconds()
+            if delta <= 0:
+                return 0
+            return int(round(delta))
+        digits = re.search(r"(\d+)", text)
+        if digits:
+            return int(digits.group(1))
+        return None
+    try:
+        return _coerce_retry_after_value(str(value))
+    except Exception:
+        return None
+
+
+def _iter_retry_after_candidates(source: Any) -> Iterable[Any]:
+    if not source:
+        return []
+    if isinstance(source, (list, tuple, set)):
+        for item in source:
+            if isinstance(item, tuple) and len(item) == 2:
+                key, val = item
+                if isinstance(key, str) and key.lower() == "retry-after":
+                    yield val
+            else:
+                yield item
+        return
+    try:
+        items = source.items()
+    except Exception:
+        items = None
+    if items:
+        for key, val in items:
+            if isinstance(key, str) and key.lower() == "retry-after":
+                yield val
+        return
+    getter = getattr(source, "get", None)
+    if callable(getter):
+        for header in ("Retry-After", "retry-after"):
+            try:
+                value = getter(header)
+            except Exception:
+                value = None
+            if value is not None:
+                yield value
+
+
+def _extract_retry_after(exc: Any) -> Optional[int]:
+    if exc is None:
+        return None
+    candidates: List[Any] = []
+    response = getattr(exc, "response", None)
+    if response is not None:
+        candidates.extend(list(_iter_retry_after_candidates(getattr(response, "headers", None))))
+    candidates.extend(list(_iter_retry_after_candidates(getattr(exc, "http_headers", None))))
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, (list, tuple, set)):
+        for item in detail:
+            candidates.extend(list(_iter_retry_after_candidates(item)))
+    elif isinstance(detail, dict):
+        candidates.extend(list(_iter_retry_after_candidates(detail)))
+    elif isinstance(detail, str):
+        header_match = re.search(r"retry-after[:=]\s*(\S+)", detail, re.IGNORECASE)
+        if header_match:
+            candidates.append(header_match.group(1))
+        else:
+            candidates.append(detail)
+    for candidate in candidates:
+        seconds = _coerce_retry_after_value(candidate)
+        if seconds is not None:
+            return seconds
+    return None
 
 
 def _classify_category(status: Optional[int], message: str, *, exc: Any = None) -> Optional[str]:
@@ -135,8 +458,35 @@ def _classify_category(status: Optional[int], message: str, *, exc: Any = None) 
         return "timeout"
     if "timed out" in text or "timeout" in text:
         return "timeout"
-    if any(keyword in text for keyword in LOCK_KEYWORDS):
+    if status in LOCK_HTTP_STATUSES:
         return "locked"
+    if any(keyword in fault_code_text for keyword in LOCK_FAULT_KEYWORDS):
+        return "locked"
+    combined_lock_texts = [text, fault_code_text]
+    for combined in combined_lock_texts:
+        if any(keyword in combined for keyword in LOCK_KEYWORDS):
+            return "locked"
+    soap_specific = getattr(exc, "detail", None)
+    if isinstance(soap_specific, str):
+        lower_detail = soap_specific.lower()
+        if any(keyword in lower_detail for keyword in LOCK_KEYWORDS):
+            return "locked"
+    elif isinstance(soap_specific, dict):
+        for value in soap_specific.values():
+            try:
+                value_text = str(value).lower()
+            except Exception:
+                continue
+            if any(keyword in value_text for keyword in LOCK_KEYWORDS):
+                return "locked"
+    elif isinstance(soap_specific, (list, tuple, set)):
+        for item in soap_specific:
+            try:
+                value_text = str(item).lower()
+            except Exception:
+                continue
+            if any(keyword in value_text for keyword in LOCK_KEYWORDS):
+                return "locked"
     if "failedauthentication" in fault_code_text:
         return "unauthorized"
     security_token_phrases = (
@@ -183,7 +533,26 @@ def _build_error_result(
         result["fault_code"] = getattr(exc, "code", None)
         result["fault_string"] = getattr(exc, "message", None)
     if category == "locked":
-        result["lock_seconds"] = parse_lock_time(message) or 31 * 60
+        retry_after = _extract_retry_after(exc)
+        lock_seconds: Optional[int]
+        if retry_after is not None:
+            lock_seconds = max(int(retry_after), 0)
+        else:
+            lock_seconds = None
+        if not lock_seconds:
+            detail_sources: List[Any] = [message]
+            if exc is not None:
+                detail_sources.append(getattr(exc, "message", None))
+                detail_sources.append(getattr(exc, "detail", None))
+            for detail_text in detail_sources:
+                if isinstance(detail_text, str):
+                    parsed = parse_lock_time(detail_text)
+                    if parsed:
+                        lock_seconds = parsed
+                        break
+            if lock_seconds is None:
+                lock_seconds = 31 * 60
+        result["lock_seconds"] = int(lock_seconds)
     return result
 
 
@@ -695,10 +1064,13 @@ def find_onvif_port(
                 report = try_onvif_connection(ip, port, username, password)
                 verdict = report.get("final_verdict")
                 if verdict == "LOCKED":
+                    lock_wait = report.get("lock_seconds")
+                    if lock_wait is None:
+                        lock_wait = 31 * 60
                     return {
                         "status": "locked",
                         "port": port,
-                        "lock_seconds": report.get("lock_seconds", 31 * 60),
+                        "lock_seconds": lock_wait,
                         "report": report,
                     }
                 if verdict == "WRONG_CREDS":
@@ -729,7 +1101,13 @@ def find_working_credentials(
     attempts_this_run = 0
 
     def record_lock(seconds):
-        next_allowed = datetime.datetime.utcnow() + datetime.timedelta(seconds=seconds)
+        try:
+            wait_seconds = int(seconds)
+        except (TypeError, ValueError):
+            wait_seconds = 31 * 60
+        if wait_seconds <= 0:
+            wait_seconds = 31 * 60
+        next_allowed = datetime.datetime.utcnow() + datetime.timedelta(seconds=wait_seconds)
         save_progress(
             ip,
             {
@@ -751,7 +1129,7 @@ def find_working_credentials(
         if verdict in {"AUTH_OK", "INSUFFICIENT_ROLE", "LIMITED_ONVIF"}:
             return port, pw, report
         if verdict == "LOCKED":
-            return record_lock(report.get("lock_seconds", 31 * 60))
+            return record_lock(report.get("lock_seconds"))
         if verdict == "WRONG_CREDS":
             return None, None, None
         return None, None, None
@@ -772,7 +1150,7 @@ def find_working_credentials(
                     return result
                 if report and report.get("final_verdict") == "LOCKED":
                     remove_baseline(ip)
-                    return record_lock(report.get("lock_seconds", 31 * 60))
+                    return record_lock(report.get("lock_seconds"))
                 if report and report.get("final_verdict") == "WRONG_CREDS":
                     remove_baseline(ip)
                     port = None
@@ -780,7 +1158,7 @@ def find_working_credentials(
             port_info = find_onvif_port(ip, ports, username=username, password=password)
             status = port_info.get("status")
             if status == "locked":
-                return record_lock(port_info.get("lock_seconds", 31 * 60))
+                return record_lock(port_info.get("lock_seconds"))
             if status == "unauthorized":
                 return None, None, None
             if status == "success":
@@ -805,7 +1183,7 @@ def find_working_credentials(
                     return result
                 if report and report.get("final_verdict") == "LOCKED":
                     remove_baseline(ip)
-                    return record_lock(report.get("lock_seconds", 31 * 60))
+                    return record_lock(report.get("lock_seconds"))
                 if report and report.get("final_verdict") == "WRONG_CREDS":
                     should_remove_baseline = True
                     baseline_password = None
@@ -815,7 +1193,7 @@ def find_working_credentials(
             status = port_info.get("status")
             if status == "locked":
                 remove_baseline(ip)
-                return record_lock(port_info.get("lock_seconds", 31 * 60))
+                return record_lock(port_info.get("lock_seconds"))
             if status == "unauthorized":
                 should_remove_baseline = True
                 baseline_password = None
@@ -835,7 +1213,7 @@ def find_working_credentials(
         port_info = find_onvif_port(ip, ports, username=username, password=pw)
         status = port_info.get("status")
         if status == "locked":
-            return record_lock(port_info.get("lock_seconds", 31 * 60))
+            return record_lock(port_info.get("lock_seconds"))
         if status == "unauthorized":
             continue
         if status == "success":
