@@ -347,7 +347,7 @@ sudo -u zabbix python3 /usr/lib/zabbix/externalscripts/camcheck.py 192.0.2.10 --
 | `{$CAM_STATUS_AUTH_THRESHOLD}` | Количество попыток `unauthorized` до эскалации | `3` |
 | `{$CAM_STATUS_RECOVERY}` | Количество успешных опросов для снятия тревог | `3` |
 | `{$CAM_STATUS_RECOVERY_WINDOW}` | Временное окно для восстановления | `30m` |
-| `{$CAM_RTT_WARN}` | Допустимое среднее время выполнения `camcheck.py`, сек | `60` |
+| `{$CAM_RTT_WARN}` | Допустимое среднее время выполнения `camcheck.py`, сек | `15` |
 | `{$CAM_RTT_RECOVERY}` | Порог восстановления по времени выполнения, сек | `10` |
 | `{$CAM_TIME_DRIFT_WARN}` | Максимальное допустимое смещение времени, сек | `5` |
 | `{$CAM_TIME_DRIFT_RECOVERY}` | Целевое смещение времени после восстановления, сек | `2` |
