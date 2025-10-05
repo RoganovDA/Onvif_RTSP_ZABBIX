@@ -234,6 +234,48 @@ def _apply_call_status(snapshot, prefix, call_result, warnings, description):
         warnings.append(f"{description}: {error_text}")
 
 
+AUTH_WARNING_KEYWORDS = (
+    "security token",
+    "wsse",
+    "failed authentication",
+    "failedauthentication",
+    "not authorized",
+    "authorization required",
+    "unauthorized",
+)
+
+
+def _contains_auth_warning(value: Any) -> bool:
+    if not value:
+        return False
+    text = str(value).lower()
+    return any(keyword in text for keyword in AUTH_WARNING_KEYWORDS)
+
+
+def _has_auth_required(snapshot: Dict[str, Any]) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    for key, value in snapshot.items():
+        if key.endswith("_auth") and str(value).upper() == "AUTH_REQUIRED":
+            return True
+    return False
+
+
+def _should_retry_without_wsse(
+    snapshot: Dict[str, Any], warnings: List[str], rtsp_diagnostics: Optional[Dict[str, Any]]
+) -> bool:
+    if _has_auth_required(snapshot):
+        return True
+    for warning in warnings or []:
+        if _contains_auth_warning(warning):
+            return True
+    if isinstance(rtsp_diagnostics, dict):
+        for key in ("error", "status"):
+            if _contains_auth_warning(rtsp_diagnostics.get(key)):
+                return True
+    return False
+
+
 def _unique_preserve(values):
     seen = set()
     ordered = []
@@ -651,16 +693,55 @@ def main():
 
         final_verdict = auth_report.get("final_verdict")
 
+        def _gather_camera_data(use_wsse: bool):
+            cam = ONVIFCamera(address, port, username, password, encrypt=use_wsse)
+            snapshot, gathered_usernames, gathered_warnings = _collect_device_snapshot(cam)
+            rtsp_diag: Dict[str, Any] = {}
+            rtsp_result = get_rtsp_info(
+                cam, address, username, password, diagnostics=rtsp_diag
+            )
+            return snapshot, gathered_usernames, gathered_warnings, rtsp_result, rtsp_diag
+
         try:
-            camera = ONVIFCamera(address, port, username, password)
+            (
+                digest_snapshot,
+                digest_usernames,
+                digest_warnings,
+                digest_rtsp,
+                digest_rtsp_diag,
+            ) = _gather_camera_data(True)
         except Exception as exc:
             emit_with_duration({"status": "onvif_error", "error": str(exc)})
             return
 
-        device_snapshot, usernames, warnings = _collect_device_snapshot(camera)
-        notes.extend(warnings)
+        device_snapshot = digest_snapshot
+        usernames = digest_usernames
+        warnings = digest_warnings
+        rtsp_port, rtsp_path = digest_rtsp
+        rtsp_diag = digest_rtsp_diag
 
-        rtsp_port, rtsp_path = get_rtsp_info(camera, address, username, password)
+        if _should_retry_without_wsse(device_snapshot, warnings, rtsp_diag):
+            try:
+                (
+                    device_snapshot,
+                    usernames,
+                    warnings,
+                    plain_rtsp,
+                    rtsp_diag,
+                ) = _gather_camera_data(False)
+                rtsp_port, rtsp_path = plain_rtsp
+                notes.append(
+                    "Retried ONVIF requests without WS-Security after authentication errors"
+                )
+            except Exception as retry_exc:
+                notes.append(f"Retry without WS-Security failed: {retry_exc}")
+                warnings = digest_warnings
+                device_snapshot = digest_snapshot
+                usernames = digest_usernames
+                rtsp_port, rtsp_path = digest_rtsp
+                rtsp_diag = digest_rtsp_diag
+
+        notes.extend(warnings)
         if rtsp_port is None and baseline:
             rtsp_port = baseline.get("rtsp_port")
         if rtsp_path is None and baseline:

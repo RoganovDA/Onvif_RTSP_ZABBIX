@@ -2,6 +2,7 @@ import datetime
 import logging
 import re
 import socket
+import sys
 import time
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import quote, urlparse
@@ -123,12 +124,30 @@ def parse_lock_time(message: str) -> Optional[int]:
 
 def _classify_category(status: Optional[int], message: str, *, exc: Any = None) -> Optional[str]:
     text = (message or "").lower()
+    fault_code_text = ""
+    if exc is not None:
+        fault_code = getattr(exc, "code", None) or getattr(exc, "faultcode", None)
+        if isinstance(fault_code, (list, tuple)):
+            fault_code = " ".join(str(part) for part in fault_code if part)
+        if fault_code:
+            fault_code_text = str(fault_code).lower()
     if exc and isinstance(exc, (socket.timeout, TimeoutError)):
         return "timeout"
     if "timed out" in text or "timeout" in text:
         return "timeout"
     if any(keyword in text for keyword in LOCK_KEYWORDS):
         return "locked"
+    if "failedauthentication" in fault_code_text:
+        return "unauthorized"
+    security_token_phrases = (
+        "security token could not be authenticated",
+        "security token could not be authenticated or authorized",
+        "security token is not valid",
+        "failed authentication",
+        "wsse",
+    )
+    if any(phrase in text for phrase in security_token_phrases):
+        return "unauthorized"
     if status in (401, 403) or "notauthorized" in text or "unauthorized" in text or "not authorized" in text or "requires authorization" in text or "authorization required" in text:
         return "unauthorized"
     if status in (400, 404) or "novalidoperation" in text:
@@ -834,7 +853,9 @@ def normalize_rtsp_path(path: Optional[str]) -> Optional[str]:
     return "/" + path.lstrip("/")
 
 
-def get_rtsp_info(camera, ip, username, password):
+def get_rtsp_info(camera, ip, username, password, diagnostics: Optional[Dict[str, Any]] = None):
+    if diagnostics is not None:
+        diagnostics.clear()
     try:
         media_service = camera.create_media_service()
         profiles = media_service.GetProfiles()
@@ -851,9 +872,23 @@ def get_rtsp_info(camera, ip, username, password):
             path = parsed_uri.path or ""
             if parsed_uri.query:
                 path += "?" + parsed_uri.query
+            if diagnostics is not None:
+                diagnostics.update({"status": "ok", "source": "onvif"})
             return parsed_uri.port, normalize_rtsp_path(path)
     except Exception:
         logging.error("ONVIF GetStreamUri failed", exc_info=True)
+        if diagnostics is not None:
+            diagnostics.update(
+                {
+                    "status": "error",
+                    "source": "onvif",
+                }
+            )
+            exc_type, exc_value, _ = sys.exc_info()
+            if exc_value is not None:
+                diagnostics["error"] = str(exc_value)
+            if exc_type is not None:
+                diagnostics["exception"] = exc_type.__name__
 
     start = time.time()
     port = DEFAULT_RTSP_PORT
@@ -867,11 +902,33 @@ def get_rtsp_info(camera, ip, username, password):
         logging.info("Trying candidate RTSP path %s", path)
         probe = fallback_ffprobe(test_url, timeout=1)
         status = probe.get("status")
+        if diagnostics is not None:
+            diagnostics.setdefault("fallback_attempts", []).append(
+                {"path": path, "status": status}
+            )
         if status == "unauthorized":
             logging.error("RTSP path %s unauthorized", path)
+            if diagnostics is not None:
+                diagnostics.update(
+                    {
+                        "status": "unauthorized",
+                        "source": "fallback",
+                        "error": "RTSP fallback unauthorized",
+                    }
+                )
             return None, None
         if status == "ok":
             logging.info("RTSP path %s successful", path)
+            if diagnostics is not None:
+                diagnostics.update(
+                    {
+                        "status": "ok",
+                        "source": "fallback",
+                        "path": normalize_rtsp_path(path),
+                    }
+                )
             return port, path
     logging.error("No RTSP path candidates succeeded for %s", ip)
+    if diagnostics is not None and "status" not in diagnostics:
+        diagnostics.update({"status": "not_found", "source": "fallback"})
     return None, None
