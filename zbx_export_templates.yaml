@@ -11,20 +11,12 @@ zabbix_export:
         - name: 'ICMP Ping'
       groups:
         - name: 'Security Cameras - AllCamers'
-      tags:
-        - tag: service
-          value: camera
-        - tag: role
-          value: surveillance
-        - tag: env
-          value: '{$CAM_ENV}'
       items:
         - uuid: 77c3d3d384d443d4bbd075fdae70a2e9
           name: 'IP-адрес (внутренний)'
           type: DEPENDENT
           key: cam.address
           value_type: TEXT
-          history: 1d
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -60,7 +52,6 @@ zabbix_export:
           type: DEPENDENT
           key: cam.baseline_created
           value_type: TEXT
-          history: 1d
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -72,7 +63,6 @@ zabbix_export:
           type: DEPENDENT
           key: cam.dns_name
           value_type: TEXT
-          history: 1d
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -81,29 +71,17 @@ zabbix_export:
             key: 'camcheck.py[{HOST.CONN}]'
           triggers:
             - uuid: 00db56fbc26e495ab730cab0f2631417
-              expression: 'count(/ALL_CAM_Check/cam.dns_name,{$CAM_TIMEOUT},"ne","{$CAM_NTP_EXPECTED}")>0'
+              expression: 'last(/ALL_CAM_Check/cam.dns_name)<>"ntp.syshleb.ru"'
               recovery_mode: RECOVERY_EXPRESSION
-              recovery_expression: 'count(/ALL_CAM_Check/cam.dns_name,{$CAM_STATUS_RECOVERY_WINDOW},"eq","{$CAM_NTP_EXPECTED}")>={$CAM_STATUS_RECOVERY}'
-              name: 'NTP-сервер камеры не соответствует {$CAM_NTP_EXPECTED}'
-              event_name: 'NTP-сервер камеры не соответствует {$CAM_NTP_EXPECTED}'
+              recovery_expression: 'last(/ALL_CAM_Check/cam.dns_name)="ntp.syshleb.ru"'
+              name: 'NTP-сервер камеры не соответствует ntp.syshleb.ru'
+              event_name: 'NTP-сервер камеры не соответствует ntp.syshleb.ru'
               priority: INFO
-              tags:
-                - tag: scope
-                  value: performance
-                - tag: impact
-                  value: ntp
-                - tag: cause
-                  value: configuration
-                - tag: subsystem
-                  value: time-sync
-                - tag: severity
-                  value: info
         - uuid: 442ac19512e9446588dddf3fc19fb626
           name: 'Версия прошивки'
           type: DEPENDENT
           key: cam.firmware
           value_type: TEXT
-          history: 30d
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -114,8 +92,7 @@ zabbix_export:
           name: 'Кадров считано'
           type: DEPENDENT
           key: cam.frames_read
-          value_type: UNSIGNED
-          units: frames
+          value_type: TEXT
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -127,7 +104,6 @@ zabbix_export:
           type: DEPENDENT
           key: cam.hardware_id
           value_type: TEXT
-          history: 30d
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -139,7 +115,6 @@ zabbix_export:
           type: DEPENDENT
           key: cam.hw_mac
           value_type: TEXT
-          history: 30d
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -151,7 +126,6 @@ zabbix_export:
           type: DEPENDENT
           key: cam.manufacturer
           value_type: TEXT
-          history: 30d
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -163,7 +137,6 @@ zabbix_export:
           type: DEPENDENT
           key: cam.model
           value_type: TEXT
-          history: 30d
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -182,24 +155,11 @@ zabbix_export:
                 - $.frame_change_level
           master_item:
             key: 'camcheck.py[{HOST.CONN}]'
-        - uuid: 97f7d7f815f94d5ca67dbb76d5cb8e1f
-          name: 'Диагностика цвета'
-          type: DEPENDENT
-          key: cam.color_diagnosis
-          value_type: CHAR
-          history: 7d
-          preprocessing:
-            - type: JSONPATH
-              parameters:
-                - $.ColorDiagnosis
-          master_item:
-            key: 'camcheck.py[{HOST.CONN}]'
         - uuid: 6bc846f78a1b4950b50278f2c3e00235
           name: 'Список новых пользователей'
           type: DEPENDENT
           key: cam.new_usernames
           value_type: TEXT
-          history: 7d
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -211,7 +171,6 @@ zabbix_export:
           type: DEPENDENT
           key: cam.new_users
           value_type: TEXT
-          history: 7d
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -220,75 +179,30 @@ zabbix_export:
             key: 'camcheck.py[{HOST.CONN}]'
           triggers:
             - uuid: e0e135336bdc40e08cad59aff5677860
-              expression: 'count(/ALL_CAM_Check/cam.new_users,{$CAM_TIMEOUT},"eq","true")>0'
+              expression: 'last(/ALL_CAM_Check/cam.new_users)="true"'
               recovery_mode: RECOVERY_EXPRESSION
-              recovery_expression: 'count(/ALL_CAM_Check/cam.new_users,{$CAM_STATUS_RECOVERY_WINDOW},"eq","false")>={$CAM_STATUS_RECOVERY}'
+              recovery_expression: 'last(/ALL_CAM_Check/cam.new_users)="false"'
               name: 'Обнаружены новые пользователи'
               event_name: '👤 Обнаружены новые пользователи'
               priority: WARNING
               manual_close: 'YES'
-              tags:
-                - tag: scope
-                  value: security
-                - tag: impact
-                  value: auth
-                - tag: cause
-                  value: credentials
-                - tag: subsystem
-                  value: accounts
-                - tag: severity
-                  value: warning
         - uuid: 64539dfde250422599556345ef75c34c
           name: 'FPS (кадров/сек)'
           type: DEPENDENT
           key: cam.real_fps
           value_type: FLOAT
           trends: '0'
-          units: fps
           preprocessing:
             - type: JSONPATH
               parameters:
                 - $.real_fps
           master_item:
             key: 'camcheck.py[{HOST.CONN}]'
-        - uuid: 4cb8cce579d64175a192ca77b0f8a0e0
-          name: 'Время выполнения camcheck.py'
-          type: DEPENDENT
-          key: cam.execution_seconds
-          value_type: FLOAT
-          trends: '0'
-          units: s
-          preprocessing:
-            - type: JSONPATH
-              parameters:
-                - $.ExecutionSeconds
-          master_item:
-            key: 'camcheck.py[{HOST.CONN}]'
-          triggers:
-            - uuid: c053798b59a14553884e2cd22f2994a5
-              expression: 'avg(/ALL_CAM_Check/cam.execution_seconds,{$CAM_STATUS_WINDOW})>{$CAM_RTT_WARN}'
-              recovery_mode: RECOVERY_EXPRESSION
-              recovery_expression: 'avg(/ALL_CAM_Check/cam.execution_seconds,{$CAM_STATUS_RECOVERY_WINDOW})<{$CAM_RTT_RECOVERY}'
-              name: 'Время выполнения camcheck.py превышает {$CAM_RTT_WARN}s'
-              event_name: '⚙️ camcheck.py выполняется дольше {$CAM_RTT_WARN}s'
-              priority: WARNING
-              tags:
-                - tag: scope
-                  value: performance
-                - tag: impact
-                  value: nvps
-                - tag: cause
-                  value: latency
-                - tag: subsystem
-                  value: externalscripts
-                - tag: severity
-                  value: warning
         - uuid: e4fdd22775f54997a85a412057e116a7
           name: 'Разрешение (собранное)'
           type: DEPENDENT
           key: cam.resolution
           value_type: TEXT
-          history: 30d
           preprocessing:
             - type: JAVASCRIPT
               parameters:
@@ -302,7 +216,6 @@ zabbix_export:
           type: DEPENDENT
           key: cam.rtsp_path
           value_type: TEXT
-          history: 30d
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -313,7 +226,6 @@ zabbix_export:
           name: RTSP-порт
           type: DEPENDENT
           key: cam.rtsp_port
-          value_type: UNSIGNED
           trends: '0'
           preprocessing:
             - type: JSONPATH
@@ -326,7 +238,6 @@ zabbix_export:
           type: DEPENDENT
           key: cam.serial
           value_type: TEXT
-          history: 30d
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -337,10 +248,7 @@ zabbix_export:
           name: 'Статус потока'
           type: DEPENDENT
           key: cam.status
-          value_type: CHAR
-          history: 7d
-          valuemap:
-            name: 'Camera stream status'
+          value_type: TEXT
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -348,81 +256,30 @@ zabbix_export:
           master_item:
             key: 'camcheck.py[{HOST.CONN}]'
           triggers:
-            - uuid: 5f8aa7afc17e4d88bd4c4cf0b2a4e8ae
-              expression: 'count(/ALL_CAM_Check/cam.status,{$CAM_STATUS_WINDOW},"eq","unauthorized")>={$CAM_STATUS_AUTH_THRESHOLD}'
+            - uuid: 3b692aa74bd14c86a716e9c261a2a14a
+              expression: 'last(/ALL_CAM_Check/cam.status)="error"'
               recovery_mode: RECOVERY_EXPRESSION
-              recovery_expression: 'count(/ALL_CAM_Check/cam.status,{$CAM_STATUS_RECOVERY_WINDOW},"eq","ok")>={$CAM_STATUS_RECOVERY}'
-              name: 'Попытки несанкционированного доступа к камере'
-              event_name: '🚨 Попытки несанкционированного доступа к камере'
-              priority: DISASTER
-              manual_close: 'YES'
-              tags:
-                - tag: scope
-                  value: security
-                - tag: impact
-                  value: auth
-                - tag: cause
-                  value: credentials
-                - tag: subsystem
-                  value: rtsp-auth
-                - tag: severity
-                  value: disaster
-            - uuid: e6ecb38f2ed04db6b71bd486070897e1
-              expression: 'count(/ALL_CAM_Check/cam.status,{$CAM_STATUS_WINDOW},"regexp","error|not_available")>={$CAM_STATUS_ERROR_COUNT}'
-              recovery_mode: RECOVERY_EXPRESSION
-              recovery_expression: 'count(/ALL_CAM_Check/cam.status,{$CAM_STATUS_RECOVERY_WINDOW},"eq","ok")>={$CAM_STATUS_RECOVERY}'
-              name: 'Проблемы с RTSP потоком'
+              recovery_expression: 'last(/ALL_CAM_Check/cam.status)="ok"'
+              name: 'Камера недоступна'
               event_name: '📡 Камера недоступна'
-              priority: AVERAGE
-              tags:
-                - tag: scope
-                  value: performance
-                - tag: impact
-                  value: rtsp
-                - tag: cause
-                  value: stream
-                - tag: subsystem
-                  value: rtsp
-                - tag: severity
-                  value: average
+              priority: WARNING
+              manual_close: 'YES'
         - uuid: 7bbe68f20d2947f18e082899a19d9bf6
           name: 'Разница времени (сек.)'
           type: DEPENDENT
           key: cam.time_diff_sec
-          value_type: FLOAT
           trends: '0'
-          units: s
           preprocessing:
             - type: JSONPATH
               parameters:
                 - $.TimeDifferenceSeconds
           master_item:
             key: 'camcheck.py[{HOST.CONN}]'
-          triggers:
-            - uuid: 4d2594045a6b4b308396f069f69fd3e4
-              expression: 'max(/ALL_CAM_Check/cam.time_diff_sec,{$CAM_STATUS_WINDOW})>{$CAM_TIME_DRIFT_WARN}'
-              recovery_mode: RECOVERY_EXPRESSION
-              recovery_expression: 'avg(/ALL_CAM_Check/cam.time_diff_sec,{$CAM_STATUS_RECOVERY_WINDOW})<{$CAM_TIME_DRIFT_RECOVERY}'
-              name: 'Смещение времени камеры превышает {$CAM_TIME_DRIFT_WARN}s'
-              event_name: '⏰ Смещение времени камеры превышает {$CAM_TIME_DRIFT_WARN}s'
-              priority: AVERAGE
-              tags:
-                - tag: scope
-                  value: performance
-                - tag: impact
-                  value: time
-                - tag: cause
-                  value: ntp
-                - tag: subsystem
-                  value: time-sync
-                - tag: severity
-                  value: average
         - uuid: 95539e268f664bcf9e26c9e6b3068fc7
           name: 'Синхронизация времени'
           type: DEPENDENT
           key: cam.time_sync_ok
-          value_type: CHAR
-          history: 7d
+          value_type: TEXT
           preprocessing:
             - type: JSONPATH
               parameters:
@@ -431,31 +288,18 @@ zabbix_export:
             key: 'camcheck.py[{HOST.CONN}]'
           triggers:
             - uuid: 145cb82f1b254f998d221b718823803c
-              expression: 'count(/ALL_CAM_Check/cam.time_sync_ok,{$CAM_TIMEOUT},"eq","false")>0'
+              expression: 'last(/ALL_CAM_Check/cam.time_sync_ok)="false"'
               recovery_mode: RECOVERY_EXPRESSION
-              recovery_expression: 'count(/ALL_CAM_Check/cam.time_sync_ok,{$CAM_STATUS_RECOVERY_WINDOW},"eq","true")>={$CAM_STATUS_RECOVERY}'
+              recovery_expression: 'last(/ALL_CAM_Check/cam.time_sync_ok)="true"'
               name: 'Несинхронизированное время'
               event_name: '⏰ Несинхронизированное время'
               priority: WARNING
               type: MULTIPLE
               manual_close: 'YES'
-              tags:
-                - tag: scope
-                  value: performance
-                - tag: impact
-                  value: time
-                - tag: cause
-                  value: ntp
-                - tag: subsystem
-                  value: time-sync
-                - tag: severity
-                  value: warning
         - uuid: 89ba9e88bbd34665812fafb77794c4c1
           name: 'Кол-во пользователей'
           type: DEPENDENT
           key: cam.user_count
-          value_type: UNSIGNED
-          history: 30d
           trends: '0'
           preprocessing:
             - type: JSONPATH
@@ -471,58 +315,11 @@ zabbix_export:
           history: 1d
           value_type: TEXT
       macros:
-        - macro: '{$CAM_ENV}'
-          value: 'prod'
         - macro: '{$CAMERA_IP}'
           value: '{HOST.CONN}'
-        - macro: '{$CAM_NTP_EXPECTED}'
-          value: 'ntp.syshleb.ru'
-        - macro: '{$CAM_TIMEOUT}'
-          value: '30m'
-        - macro: '{$CAM_STATUS_WINDOW}'
-          value: '30m'
-        - macro: '{$CAM_STATUS_ERROR_COUNT}'
-          value: '3'
-        - macro: '{$CAM_STATUS_AUTH_THRESHOLD}'
-          value: '3'
-        - macro: '{$CAM_STATUS_RECOVERY}'
-          value: '3'
-        - macro: '{$CAM_STATUS_RECOVERY_WINDOW}'
-          value: '30m'
-        - macro: '{$CAM_RTT_WARN}'
-          value: '15'
-        - macro: '{$CAM_RTT_RECOVERY}'
-          value: '10'
-        - macro: '{$CAM_TIME_DRIFT_WARN}'
-          value: '5'
-        - macro: '{$CAM_TIME_DRIFT_RECOVERY}'
-          value: '2'
-      valuemaps:
-        - uuid: 8e13c4b5c28048bfae30119500f0b314
-          name: 'Camera stream status'
-          mappings:
-            - value: ok
-              newvalue: 'OK'
-            - value: unauthorized
-              newvalue: 'Unauthorized'
-            - value: not_available
-              newvalue: 'Not available'
-            - value: error
-              newvalue: 'Error'
   triggers:
     - uuid: 24a64ca59d2c4564bfe3b2ee96858b98
       expression: 'change(/ALL_CAM_Check/cam.serial)=1 or change(/ALL_CAM_Check/cam.model)=1'
       name: 'Возможная замена камеры (модель или серийный номер изменились)'
       priority: WARNING
       manual_close: 'YES'
-      tags:
-        - tag: scope
-          value: security
-        - tag: impact
-          value: integrity
-        - tag: cause
-          value: hardware
-        - tag: subsystem
-          value: inventory
-        - tag: severity
-          value: warning
